@@ -1,211 +1,221 @@
-<script>
-(() => {
-  // =========================
-  // CONFIG (same as before)
-  // =========================
-  const HOURS = 48; // exact lifetime for the offer
-  const API_URL = 'https://everlymade.vercel.app/api/thankyouclaim';
-  const LOCAL_CODE_KEY = 'qr_lp_claim_v1';      // cached { code, expiresAt }
-  const LOCAL_DEADLINE_KEY = 'qr_deadline_v2';  // cached raw deadline (ms)
-  const DISPLAY_TZ = 'America/Chicago';         // set your display timezone
+// api/thankyouclaim.js — CommonJS serverless function (Vercel /api/*)
+// - One active code per IP (plus your existing localStorage guard)
+// - Upstash Redis via REST (no extra npm deps)
+// api/thankyouclaim.js — CommonJS (Vercel /api/*)
+// - One active code per IP (Upstash Redis lock)
+// - Honors a *client-provided* earlier expiresAt (grabs old timer)
+// - Codes shaped like TY-####
 
-  // =========================
-  // DOM handles (same IDs)
-  // =========================
-  const el = {
-    d:  document.getElementById('qr-day'),
-    h:  document.getElementById('qr-hour'),
-    m:  document.getElementById('qr-min'),
-    s:  document.getElementById('qr-sec'),
-    code: document.getElementById('qr-code'),
-    msg:  document.getElementById('qr-msg'),
-    apply: document.getElementById('qr-apply'),
-    copy:  document.getElementById('qr-copy'),
-    // if your theme also has a <countdown-timer> custom element, we’ll sync it too:
-    timerEl: document.querySelector('countdown-timer')
-  };
+const crypto = require('crypto');
 
-  // =========================
-  // Helpers (same style)
-  // =========================
-  const pad = n => String(n).padStart(2,'0');
-  const nowMs = () => Date.now();
+const SHOPIFY_SHOP         = process.env.SHOPIFY_SHOP;               // e.g. charmsforchange.myshopify.com
+const SHOPIFY_ADMIN_TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;        // shpat_...
+const API_VERSION          = '2025-07';
+const SHOPIFY_SHOP        = process.env.SHOPIFY_SHOP;               // e.g. charmsforchange.myshopify.com
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;        // shpat_...
+const API_VERSION         = '2025-07';
 
-  function fmtInTZ(ms){
-    try {
-      return new Intl.DateTimeFormat(undefined, {
-        timeZone: DISPLAY_TZ,
-        dateStyle: 'medium',
-        timeStyle: 'short',
-        timeZoneName: 'short'
-      }).format(new Date(ms));
-    } catch {
-      return new Date(ms).toLocaleString();
-    }
-  }
+// Upstash Redis (REST)
+// Upstash Redis REST
+const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-  function setMsg(text){
-    if (el.msg) el.msg.textContent = text || '';
-  }
+// Env options
+const IP_HASH_SALT       = process.env.IP_HASH_SALT || 'change-me-long-random-salt';
+const TY_PERCENT         = parseFloat(process.env.TY_PERCENT || '20') || 20;  // e.g. "20"
+const TY_COOLDOWN_HOURS  = parseFloat(process.env.TY_COOLDOWN_HOURS || '0') || 0; // hours after expiry
+const IP_HASH_SALT      = process.env.IP_HASH_SALT || 'change-me-long-random-salt';
+const TY_PERCENT        = parseFloat(process.env.TY_PERCENT || '20') || 20; // percentage number, e.g. 20
+const TY_COOLDOWN_HOURS = parseFloat(process.env.TY_COOLDOWN_HOURS || '0') || 0; // hours after expiry
 
-  function paintDigits(diffMs){
-    const s = Math.max(0, Math.floor(diffMs/1000));
-    const d = Math.floor(s/86400);
-    const h = Math.floor((s%86400)/3600);
-    const m = Math.floor((s%3600)/60);
-    const sec = s%60;
-    el.d && (el.d.textContent = pad(d));
-    el.h && (el.h.textContent = pad(h));
-    el.m && (el.m.textContent = pad(m));
-    el.s && (el.s.textContent = pad(sec));
-  }
+// ---- Upstash helpers (REST) ----
+// ---- Redis helpers ----
+async function kvGet(key) {
+if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
+const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
+@@ -31,18 +31,24 @@ async function kvGet(key) {
 
-  function syncCustomTimer(tsMs){
-    if (!el.timerEl || !tsMs) return;
-    try { el.timerEl.setAttribute('expires-at', new Date(tsMs).toISOString()); } catch {}
-  }
+async function kvSetEx(key, value, ttlSeconds) {
+if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  // Upstash expects the value in the path and TTL via ?EX=
+  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${encodeURIComponent(ttlSeconds)}`;
+  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(
+    JSON.stringify(value)
+  )}?EX=${encodeURIComponent(ttlSeconds)}`;
+const r = await fetch(url, {
+method: 'POST',
+headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+});
+return r.ok;
+}
 
-  function saveDeadline(ms){
-    try { localStorage.setItem(LOCAL_DEADLINE_KEY, String(ms)); } catch {}
-  }
+// ---- Utility helpers ----
+// ---- Utils ----
 
-  function loadDeadline(){
-    try {
-      const saved = parseInt(localStorage.getItem(LOCAL_DEADLINE_KEY) || '0', 10);
-      return Number.isFinite(saved) ? saved : 0;
-    } catch { return 0; }
-  }
+// Make TY-#### (4 base36 uppercase)
+function genCode(prefix = 'TY') {
+  const slug = Math.random().toString(36).slice(2, 10).toUpperCase(); // 8 chars → very low collision
+  let slug = Math.random().toString(36).slice(2, 6).toUpperCase();
+  // ensure exactly 4 chars (fallback)
+  while (slug.length < 4) slug += '0';
+  slug = slug.slice(0, 4);
+return `${prefix}-${slug}`;
+}
 
-  function saveCodeCache(code, expiresAtIso){
-    try { localStorage.setItem(LOCAL_CODE_KEY, JSON.stringify({ code, expiresAt: expiresAtIso })); } catch {}
-  }
+@@ -69,38 +75,48 @@ module.exports = async (req, res) => {
+try {
+res.setHeader('Access-Control-Allow-Origin', '*');
 
-  function loadCodeCache(){
-    try { return JSON.parse(localStorage.getItem(LOCAL_CODE_KEY) || 'null'); } catch { return null; }
-  }
+    // Parse body + compute the desired expiry window
+    // Parse request
+const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+    const { expiresAt } = body;
+    const clientExpiresAtIso = body?.expiresAt; // from your front-end timer/localStorage
 
-  // ======================================
-  // 1) Establish an immediate local end
-  // ======================================
-  let end = nowMs() + HOURS*60*60*1000; // fallback 48h from now
+    const now = Date.now();
+    const startsAt = new Date(now);
 
-  // if a prior deadline is saved and is close to 48h window, reuse it (prevents flicker)
-  const prior = loadDeadline();
-  if (prior > nowMs() && Math.abs(prior - end) < 10*60*1000) {
-    end = prior;
-  } else {
-    saveDeadline(end);
-  }
+    // Default server window = 48h from now
+    const serverDefaultEnd = new Date(now + 48 * 60 * 60 * 1000);
 
-  // Paint right away
-  paintDigits(end - nowMs());
-  syncCustomTimer(end);
-
-  // Drive the digits like before
-  const tmr = setInterval(() => {
-    const diff = end - nowMs();
-    paintDigits(diff);
-    if (diff <= 0) {
-      setMsg('Offer expired.');
-      if (el.apply) el.apply.disabled = true;
-      clearInterval(tmr);
-    }
-  }, 250);
-
-  // ====================================================
-  // 2) Claim/Reclaim (with server-sync of true endsAt)
-  // ====================================================
-  async function claim() {
-    // If we already created a code for this visitor and it hasn't expired, reuse it
-    const saved = loadCodeCache();
-    const savedEndMs = Date.parse(saved?.expiresAt || '');
-    if (saved && saved.code && savedEndMs > nowMs()) {
-      console.info('[thankyouclaim] using cached code', saved.code, 'exp:', saved.expiresAt);
-      if (el.code) el.code.textContent = saved.code;
-      setMsg('Code created. Expires at ' + fmtInTZ(savedEndMs));
-      // make sure our timer is synced to cached expiry
-      end = savedEndMs;
-      saveDeadline(end);
-      syncCustomTimer(end);
-      return saved;
-    }
-
-    // Ask your API to mint / return a code. We send our current local end,
-    // but the server may return an earlier endsAt (for IP-lock consistency).
-    const body = { expiresAt: new Date(end).toISOString() };
-    console.info('[thankyouclaim] POST', API_URL, body);
-
-    let r, data = {};
-    try {
-      r = await fetch(API_URL, {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify(body)
-      });
-      try { data = await r.json(); } catch {}
-      console.info('[thankyouclaim] response', r?.status, data);
-    } catch (e) {
-      console.warn('[thankyouclaim] network error', e);
-      setMsg('Could not create code.');
-      if (el.apply) el.apply.disabled = true;
-      return null;
-    }
-
-    // Friendly handling for IP cooldown/rate-limit
-    if (r.status === 429) {
-      const serverEnd = Date.parse(data?.endsAt || data?.expiresAt || '');
-      if (data?.code && el.code) el.code.textContent = data.code;
-      if (serverEnd) {
-        end = serverEnd;             // <-- CRITICAL: always trust server
-        saveDeadline(end);
-        syncCustomTimer(end);
-        setMsg((data?.message || 'This offer was already claimed from your network.') + ' Expires at ' + fmtInTZ(end));
-      } else {
-        setMsg(data?.message || 'This offer was already claimed from your network.');
+    const startsAt = new Date();
+    const endsAt   = expiresAt ? new Date(expiresAt) : new Date(startsAt.getTime() + 48 * 60 * 60 * 1000);
+    const nowMs    = Date.now();
+    // If client sent a valid *earlier* expiry, honor it (grab old timer)
+    let chosenEndsAt = serverDefaultEnd;
+    if (clientExpiresAtIso) {
+      const clientEndMs = Date.parse(clientExpiresAtIso);
+      if (!Number.isNaN(clientEndMs) && clientEndMs > now && clientEndMs < serverDefaultEnd.getTime()) {
+        chosenEndsAt = new Date(clientEndMs);
       }
-      // allow applying if we have a code
-      if (el.apply && data?.code) el.apply.disabled = false;
-      return null;
     }
 
-    if (!r.ok || !data?.code) {
-      setMsg('Could not create code' + (r?.status ? ` (${r.status})` : ''));
-      if (el.apply) el.apply.disabled = true;
-      return null;
-    }
+    // ---- IP lock: check for existing active code for this IP ----
+    const ip     = getClientIp(req);
+    // ---- IP lock ----
+    const ip = getClientIp(req);
+const ipHash = hashIp(ip);
+    const kvKey  = `ty:ip:${ipHash}`;
+    const kvKey = `ty:ip:${ipHash}`;
 
-    // ---- SUCCESS: show code + sync timer to server-provided endsAt ----
-    const serverEnd = Date.parse(data.endsAt || data.expiresAt || end);
-    if (el.code) el.code.textContent = data.code;
-    end = serverEnd;                 // <-- CRITICAL: always trust server
-    saveDeadline(end);
-    syncCustomTimer(end);
+const existing = await kvGet(kvKey);
 
-    setMsg('Code created. Expires at ' + fmtInTZ(end));
-    saveCodeCache(data.code, new Date(end).toISOString());
-    return data;
-  }
+if (existing) {
+const existingEnd = Date.parse(existing.endsAt);
+      if (existingEnd > nowMs) {
+        // Still active → return the same code (no new Shopify mutation)
+      if (existingEnd > now) {
+        // still active: return same code and the original endsAt (keeps timer consistent)
+return res.status(200).json({
+ok: true,
+code:     existing.code,
+startsAt: existing.startsAt,
+endsAt:   existing.endsAt,
+nodeId:   existing.nodeId || null,
+          reused:   true
+          reused:   true,
+});
+}
+// Optional cooldown after expiry
+if (TY_COOLDOWN_HOURS > 0) {
+const cooldownUntil = existingEnd + TY_COOLDOWN_HOURS * 3600 * 1000;
+        if (cooldownUntil > nowMs) {
+        if (cooldownUntil > now) {
+return res.status(429).json({
+error: 'rate_limited',
+message: 'This offer was already claimed from your network. Try again later.',
+@@ -112,8 +128,7 @@ module.exports = async (req, res) => {
+}
+}
 
-  claim();
+    // ---- Create a Shopify discount (new code) ----
+    // Retry a few times in the unlikely event of a collision or transient error
+    // ---- Create Shopify discount (new code) ----
+let lastErr = null;
+let code = null;
+let nodeId = null;
+@@ -132,14 +147,14 @@ module.exports = async (req, res) => {
 
-  // =========================
-  // Buttons (same as before)
-  // =========================
-  el.apply && el.apply.addEventListener('click', () => {
-    const saved = loadCodeCache();
-    const code  = (saved && saved.code) || (el.code?.textContent || '').trim();
-    if (!code || code.includes('—')) return;
-    window.location.href = `/discount/${encodeURIComponent(code)}?redirect=/collections/all`;
-  });
+const variables = {
+basicCodeDiscount: {
+          title: tryCode, // admin title = code (no "Thank you" prefix)
+          title: tryCode,                                 // Title == code (clean)
+startsAt: startsAt.toISOString(),
+          endsAt:   endsAt.toISOString(),
+          endsAt:   chosenEndsAt.toISOString(),
 
-  el.copy && el.copy.addEventListener('click', async () => {
-    const code = (el.code?.textContent || '').trim();
-    if (!code || code.includes('—')) return;
-    try {
-      await navigator.clipboard.writeText(code);
-      el.copy.textContent='Copied!';
-      setTimeout(()=> el.copy.textContent='Copy code', 1200);
-    } catch(e){}
-  });
-})();
-</script>
+customerSelection: { all: true },
+
+customerGets: {
+            value: { percentage: Math.min(1, Math.max(0, TY_PERCENT / 100)) }, // decimal 0–1
+            value: { percentage: Math.min(1, Math.max(0, TY_PERCENT / 100)) },
+items: { all: true }
+},
+
+@@ -167,34 +182,19 @@ module.exports = async (req, res) => {
+
+const data = await r.json().catch(() => ({}));
+
+      if (!r.ok) {
+        lastErr = new Error(`Shopify HTTP ${r.status}`);
+        continue;
+      }
+
+      if (data?.errors?.length) {
+        lastErr = new Error(`GraphQL: ${JSON.stringify(data.errors)}`);
+        continue;
+      }
+      if (!r.ok) { lastErr = new Error(`Shopify HTTP ${r.status}`); continue; }
+      if (data?.errors?.length) { lastErr = new Error(`GraphQL: ${JSON.stringify(data.errors)}`); continue; }
+
+const errs = data?.data?.discountCodeBasicCreate?.userErrors;
+if (errs?.length) {
+        // If code already exists, retry; otherwise bail with validation error
+const existsErr = errs.find(e => String(e.message || '').toLowerCase().includes('already exists'));
+        if (existsErr) {
+          lastErr = new Error('Code collision, retrying…');
+          continue;
+        }
+        if (existsErr) { lastErr = new Error('Code collision, retrying…'); continue; }
+return res.status(400).json({ error: 'Shopify validation error', userErrors: errs });
+}
+
+const node = data?.data?.discountCodeBasicCreate?.codeDiscountNode;
+      if (!node) {
+        lastErr = new Error('No codeDiscountNode returned');
+        continue;
+      }
+      if (!node) { lastErr = new Error('No codeDiscountNode returned'); continue; }
+
+      // Success
+code   = tryCode;
+nodeId = node.id;
+break;
+@@ -205,23 +205,23 @@ module.exports = async (req, res) => {
+return res.status(502).json({ error: 'Failed to create discount code' });
+}
+
+    // Save to Redis (TTL = time until expiry + optional cooldown)
+    // Save IP lock: TTL = time until chosenEndsAt + optional cooldown
+const ttlSec =
+      Math.max(1, Math.ceil((Date.parse(endsAt) - nowMs) / 1000)) +
+      Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000)) +
+Math.max(0, Math.floor(TY_COOLDOWN_HOURS * 3600));
+
+await kvSetEx(kvKey, {
+code,
+startsAt: startsAt.toISOString(),
+      endsAt:   endsAt.toISOString(),
+      endsAt:   chosenEndsAt.toISOString(),
+nodeId
+}, ttlSec);
+
+return res.status(200).json({
+ok: true,
+code,
+startsAt: startsAt.toISOString(),
+      endsAt:   endsAt.toISOString(),
+      endsAt:   chosenEndsAt.toISOString(),
+nodeId
+});
+} catch (e) {
