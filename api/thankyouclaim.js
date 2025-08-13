@@ -3,7 +3,7 @@ const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP;             // "your-store.myshop
 const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const API_VERSION = '2024-04';
 
-function genCode(prefix = 'THANKYOU') {
+function genCode(prefix = 'TY') {
   const slug = Math.random().toString(36).slice(2, 6).toUpperCase();
   return `${prefix}-${slug}`;
 }
