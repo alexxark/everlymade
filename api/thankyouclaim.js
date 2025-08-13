@@ -1,81 +1,109 @@
-// CommonJS export so we don't depend on ESM config.
-// Also supports GET for a quick "is the route alive?" check.
+// /pages/api/thankyouclaim.ts (or /app/api/thankyouclaim/route.ts with minor tweaks)
+import type { NextApiRequest, NextApiResponse } from 'next';
 
-const ALLOW_ORIGINS = [
-  "https://everlymade.com",
-  "https://everlymade.myshopify.com"
-];
+const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP as string;          // "your-store.myshopify.com"
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN as string; // Admin API access token
+const API_VERSION = '2024-04'; // or your pinned version
 
-function setCors(res, origin) {
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+function genCode(prefix = 'THANKYOU') {
+  const slug = Math.random().toString(36).slice(2, 6).toUpperCase();
+  return `${prefix}-${slug}`;
 }
 
-module.exports = async (req, res) => {
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  // CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    return res.status(204).end();
+  }
+
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
   try {
-    const origin = req.headers.origin || "";
-    const allowed = ALLOW_ORIGINS.includes(origin) ? origin : ALLOW_ORIGINS[0];
-    setCors(res, allowed);
+    res.setHeader('Access-Control-Allow-Origin', '*');
 
-    // Quick health check that does NOT call Shopify
-    if (req.method === "GET") {
-      return res.status(200).json({ ok: true, route: "thankyouclaim" });
-    }
+    // If the client passes an expiresAt (ISO), use it; otherwise 48h from now
+    const { expiresAt } = req.body || {};
+    const startsAt = new Date();
+    const endsAt = expiresAt ? new Date(expiresAt) : new Date(startsAt.getTime() + 48 * 60 * 60 * 1000);
 
-    if (req.method === "OPTIONS") return res.status(204).end();
-    if (req.method !== "POST") return res.status(405).json({ message: "Method not allowed" });
+    const code = genCode('THANKYOU');
 
-    // Parse body
-    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
-    const now = new Date();
-    const endsAtISO = body?.expiresAt
-      ? new Date(body.expiresAt).toISOString()
-      : new Date(now.getTime() + 20 * 60 * 1000).toISOString(); // default 20 min
-
-    const code = "QR-" + Math.random().toString(16).slice(2, 10).toUpperCase();
-    const shop   = process.env.SHOPIFY_SHOP;           // e.g., everlymade.myshopify.com
-    const token  = process.env.SHOPIFY_ADMIN_TOKEN;    // admin API access token (Custom App)
-    const pct    = Number(process.env.QR_PERCENT || "20");
-
-    if (!shop || !token) {
-      return res.status(500).json({ message: "Missing SHOPIFY_SHOP or SHOPIFY_ADMIN_TOKEN" });
-    }
-
-    // Build Shopify GraphQL call (using global fetch on Vercel/Node 18+)
-    const query = `
-      mutation discountCodeBasicCreate($basic: DiscountCodeBasicInput!) {
-        discountCodeBasicCreate(basic: $basic) {
-          codeDiscountNode { id }
+    const mutation = `
+      mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
+        discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
+          codeDiscountNode {
+            id
+            codeDiscount {
+              ... on DiscountCodeBasic {
+                title
+                codes(first: 1) { nodes { code } }
+                status
+                startsAt
+                endsAt
+              }
+            }
+          }
           userErrors { field message }
         }
-      }`;
+      }
+    `;
+
+    // EXAMPLE: 10% off; tweak as needed (fixedAmount, collections, etc.)
     const variables = {
-      basic: {
-        title: `QR Flash ${pct}%`,
-        startsAt: now.toISOString(),
-        endsAt: endsAtISO,
-        customerGets: { items: { all: true }, value: { percentage: pct / 100 } },
-        usageLimit: 1,
-        appliesOncePerCustomer: true,
-        codes: [{ code }]
+      basicCodeDiscount: {
+        title: `Thank You ${code}`,
+        startsAt: startsAt.toISOString(),
+        endsAt: endsAt.toISOString(),
+        code,
+        customerGets: {
+          value: { percentage: 10 }, // or { fixedAmount: { amount: "5.00" } }
+          items: { all: true }       // restrict to a collection via items: { collections: { add: ["gid://shopify/Collection/123"] } }
+        },
+        combinesWith: { orderDiscounts: true, productDiscounts: false, shippingDiscounts: false },
+        usageLimit: 1,     // set to null for unlimited; adjust if you want single-use
+        appliesOncePerCustomer: true
       }
     };
 
-    const resp = await fetch(`https://${shop}/admin/api/2024-07/graphql.json`, {
-      method: "POST",
-      headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
-      body: JSON.stringify({ query, variables })
+    const r = await fetch(`https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`, {
+      method: 'POST',
+      headers: {
+        'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query: mutation, variables })
     });
 
-    const json = await resp.json().catch(() => ({}));
-    const errs = json?.data?.discountCodeBasicCreate?.userErrors;
-    if (errs?.length) return res.status(400).json({ message: errs.map(e => e.message).join("; ") });
+    const data = await r.json();
+    if (!r.ok) {
+      console.error('Shopify HTTP error', r.status, data);
+      return res.status(502).json({ error: 'Shopify HTTP error', status: r.status, details: data });
+    }
 
-    return res.status(200).json({ code, expiresAt: endsAtISO });
-  } catch (e) {
-    console.error("Function error:", e);
-    return res.status(500).json({ message: "Failed to create discount" });
+    const errs = data?.data?.discountCodeBasicCreate?.userErrors;
+    if (errs?.length) {
+      console.error('Shopify userErrors', errs);
+      return res.status(400).json({ error: 'Shopify validation error', userErrors: errs });
+    }
+
+    const node = data?.data?.discountCodeBasicCreate?.codeDiscountNode;
+    if (!node) {
+      console.error('No codeDiscountNode in response', data);
+      return res.status(500).json({ error: 'No codeDiscountNode returned' });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      code,
+      startsAt: startsAt.toISOString(),
+      endsAt: endsAt.toISOString(),
+      nodeId: node.id
+    });
+  } catch (e: any) {
+    console.error('Unhandled error creating discount', e);
+    return res.status(500).json({ error: 'Unhandled error', message: e?.message });
   }
-};
+}
