@@ -1,7 +1,7 @@
-// api/thankyouclaim.js  — CommonJS serverless function (works on Vercel root /api/*)
-const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP;             // "your-store.myshopify.com"
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
-const API_VERSION = '2024-04';
+// api/thankyouclaim.js — CommonJS serverless function (Vercel root /api/*)
+const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP;                 // e.g. charmsforchange.myshopify.com
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;   // shpat_...
+const API_VERSION = '2025-07';                                 // bump to current
 
 function genCode(prefix = 'TY') {
   const slug = Math.random().toString(36).slice(2, 6).toUpperCase();
@@ -30,8 +30,11 @@ module.exports = async (req, res) => {
 
     const startsAt = new Date();
     const endsAt = expiresAt ? new Date(expiresAt) : new Date(startsAt.getTime() + 48 * 60 * 60 * 1000);
-    const code = genCode('THANKYOU');
 
+    // Generate code with TY prefix
+    const code = genCode('TY');
+
+    // GraphQL mutation (uses SINGLE "code", not "codes")
     const mutation = `
       mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
         discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
@@ -41,33 +44,36 @@ module.exports = async (req, res) => {
       }
     `;
 
+    // Read percent from env (e.g., TY_PERCENT="20") → decimal 0.20
+    const pct = Math.min(
+      1,
+      Math.max(0, (parseFloat(process.env.TY_PERCENT || '20') || 20) / 100)
+    );
+
     const variables = {
-  basicCodeDiscount: {
-    title: `Thank You ${code}`,
-    startsAt: startsAt.toISOString(),
-    endsAt: endsAt.toISOString(),
+      basicCodeDiscount: {
+        title: `Thank You ${code}`,
+        startsAt: startsAt.toISOString(),
+        endsAt: endsAt.toISOString(),
 
-    // who can use it
-    customerSelection: { all: true },   // 👈 REQUIRED on 2025-07
+        // Required on newer API versions
+        customerSelection: { all: true },
 
-    // what they get
-    customerGets: {
-      value: { percentage: 0.20 },      // 👈 20% as a decimal (0–1)
-      items: { all: true }              // or restrict to collections/products
-    },
+        // What the customer gets
+        customerGets: {
+          value: { percentage: pct },   // decimal 0–1
+          items: { all: true }
+        },
 
-    // stacking rules
-    combinesWith: { orderDiscounts: true, productDiscounts: false, shippingDiscounts: false },
+        // Stacking + usage
+        combinesWith: { orderDiscounts: true, productDiscounts: false, shippingDiscounts: false },
+        usageLimit: 1,
+        appliesOncePerCustomer: true,
 
-    // usage rules
-    usageLimit: 1,                       // 1 total use (set null for unlimited)
-    appliesOncePerCustomer: true,
-
-    // the code(s) to create
-    codes: [code]                        // 👈 array of strings
-  }
-};
-
+        // SINGLE code field
+        code
+      }
+    };
 
     const r = await fetch(`https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`, {
       method: 'POST',
@@ -79,6 +85,12 @@ module.exports = async (req, res) => {
     });
 
     const data = await r.json().catch(() => ({}));
+
+    // Top-level GraphQL errors
+    if (data?.errors?.length) {
+      console.error('GraphQL errors', data.errors);
+      return res.status(400).json({ error: 'GraphQL error', errors: data.errors });
+    }
 
     if (!r.ok) {
       console.error('Shopify HTTP error', r.status, data);
