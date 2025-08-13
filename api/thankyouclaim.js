@@ -42,20 +42,32 @@ module.exports = async (req, res) => {
     `;
 
     const variables = {
-      basicCodeDiscount: {
-        title: `Thank You ${code}`,
-        startsAt: startsAt.toISOString(),
-        endsAt: endsAt.toISOString(),
-        code,
-        customerGets: {
-          value: { percentage: 10 },
-          items: { all: true }
-        },
-        combinesWith: { orderDiscounts: true, productDiscounts: false, shippingDiscounts: false },
-        usageLimit: 1,
-        appliesOncePerCustomer: true
-      }
-    };
+  basicCodeDiscount: {
+    title: `Thank You ${code}`,
+    startsAt: startsAt.toISOString(),
+    endsAt: endsAt.toISOString(),
+
+    // who can use it
+    customerSelection: { all: true },   // 👈 REQUIRED on 2025-07
+
+    // what they get
+    customerGets: {
+      value: { percentage: 0.20 },      // 👈 20% as a decimal (0–1)
+      items: { all: true }              // or restrict to collections/products
+    },
+
+    // stacking rules
+    combinesWith: { orderDiscounts: true, productDiscounts: false, shippingDiscounts: false },
+
+    // usage rules
+    usageLimit: 1,                       // 1 total use (set null for unlimited)
+    appliesOncePerCustomer: true,
+
+    // the code(s) to create
+    codes: [code]                        // 👈 array of strings
+  }
+};
+
 
     const r = await fetch(`https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`, {
       method: 'POST',
