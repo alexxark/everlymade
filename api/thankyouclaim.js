@@ -52,7 +52,7 @@ module.exports = async (req, res) => {
 
     const variables = {
       basicCodeDiscount: {
-        title: `Thank You ${code}`,
+        title: code,
         startsAt: startsAt.toISOString(),
         endsAt: endsAt.toISOString(),
 
@@ -66,7 +66,7 @@ module.exports = async (req, res) => {
         },
 
         // Stacking + usage
-        combinesWith: { orderDiscounts: true, productDiscounts: false, shippingDiscounts: false },
+        combinesWith: { orderDiscounts: false, productDiscounts: true, shippingDiscounts: true },
         usageLimit: 1,
         appliesOncePerCustomer: true,
 
