@@ -1,26 +1,37 @@
 <script>
 (() => {
-  // ====== CONFIG ======
-  const HOURS = 48;                               // local fallback window
+  // =========================
+  // CONFIG (same as before)
+  // =========================
+  const HOURS = 48; // exact lifetime for the offer
   const API_URL = 'https://everlymade.vercel.app/api/thankyouclaim';
-  const DISPLAY_TZ = 'America/Los_Angeles';       // change if you want a different timezone
-  const PERSIST = true;                           // persist the countdown per browser
+  const LOCAL_CODE_KEY = 'qr_lp_claim_v1';      // cached { code, expiresAt }
+  const LOCAL_DEADLINE_KEY = 'qr_deadline_v2';  // cached raw deadline (ms)
+  const DISPLAY_TZ = 'America/Chicago';         // set your display timezone
 
-  // versioned keys so old local data won't break new logic
-  const KEY_VER = 'v3';
-  const DEADLINE_KEY = `countdown_deadline_${KEY_VER}`;
-  const CODE_KEY = `qr_claim_${KEY_VER}`;
-
-  // ====== DOM ======
-  const timerEl = document.querySelector('countdown-timer');
+  // =========================
+  // DOM handles (same IDs)
+  // =========================
   const el = {
-    code:  document.getElementById('qr-code'),
-    msg:   document.getElementById('qr-msg'),
+    d:  document.getElementById('qr-day'),
+    h:  document.getElementById('qr-hour'),
+    m:  document.getElementById('qr-min'),
+    s:  document.getElementById('qr-sec'),
+    code: document.getElementById('qr-code'),
+    msg:  document.getElementById('qr-msg'),
     apply: document.getElementById('qr-apply'),
     copy:  document.getElementById('qr-copy'),
+    // if your theme also has a <countdown-timer> custom element, we’ll sync it too:
+    timerEl: document.querySelector('countdown-timer')
   };
 
-  function fmt(ms){
+  // =========================
+  // Helpers (same style)
+  // =========================
+  const pad = n => String(n).padStart(2,'0');
+  const nowMs = () => Date.now();
+
+  function fmtInTZ(ms){
     try {
       return new Intl.DateTimeFormat(undefined, {
         timeZone: DISPLAY_TZ,
@@ -33,110 +44,168 @@
     }
   }
 
-  function setTimer(ms){
-    if (timerEl && ms && !Number.isNaN(ms)) {
-      timerEl.setAttribute('expires-at', new Date(ms).toISOString());
-      if (PERSIST) localStorage.setItem(DEADLINE_KEY, String(ms));
-    }
+  function setMsg(text){
+    if (el.msg) el.msg.textContent = text || '';
   }
 
-  function setMsg(s){ if (el.msg) el.msg.textContent = s || ''; }
-
-  // ====== 1) Bootstrap local deadline (used only for initial UI) ======
-  const now = Date.now();
-  const fallbackEnd = now + HOURS * 60 * 60 * 1000;
-
-  let endAt = fallbackEnd;
-
-  if (PERSIST) {
-    const saved = parseInt(localStorage.getItem(DEADLINE_KEY) || '0', 10);
-    // only reuse a saved deadline if it is in the future and roughly matches a 48h window
-    if (saved > now && Math.abs(saved - fallbackEnd) < 10 * 60 * 1000) {
-      endAt = saved;
-    } else {
-      localStorage.setItem(DEADLINE_KEY, String(endAt));
-    }
+  function paintDigits(diffMs){
+    const s = Math.max(0, Math.floor(diffMs/1000));
+    const d = Math.floor(s/86400);
+    const h = Math.floor((s%86400)/3600);
+    const m = Math.floor((s%3600)/60);
+    const sec = s%60;
+    el.d && (el.d.textContent = pad(d));
+    el.h && (el.h.textContent = pad(h));
+    el.m && (el.m.textContent = pad(m));
+    el.s && (el.s.textContent = pad(sec));
   }
 
-  // Paint the UI immediately with our best guess
-  setTimer(endAt);
+  function syncCustomTimer(tsMs){
+    if (!el.timerEl || !tsMs) return;
+    try { el.timerEl.setAttribute('expires-at', new Date(tsMs).toISOString()); } catch {}
+  }
 
-  // ====== 2) Call API and ALWAYS sync to server endsAt ======
-  (async () => {
-    let bodyExpires = null;
+  function saveDeadline(ms){
+    try { localStorage.setItem(LOCAL_DEADLINE_KEY, String(ms)); } catch {}
+  }
+
+  function loadDeadline(){
     try {
-      const cached = JSON.parse(localStorage.getItem(CODE_KEY) || 'null');
-      // prefer any cached code's expiry to avoid extending the window
-      bodyExpires = cached?.expiresAt || new Date(endAt).toISOString();
-    } catch {
-      bodyExpires = new Date(endAt).toISOString();
-    }
+      const saved = parseInt(localStorage.getItem(LOCAL_DEADLINE_KEY) || '0', 10);
+      return Number.isFinite(saved) ? saved : 0;
+    } catch { return 0; }
+  }
 
-    const r = await fetch(API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ expiresAt: bodyExpires })
-    });
+  function saveCodeCache(code, expiresAtIso){
+    try { localStorage.setItem(LOCAL_CODE_KEY, JSON.stringify({ code, expiresAt: expiresAtIso })); } catch {}
+  }
 
-    let data = {};
-    try { data = await r.json(); } catch {}
+  function loadCodeCache(){
+    try { return JSON.parse(localStorage.getItem(LOCAL_CODE_KEY) || 'null'); } catch { return null; }
+  }
 
-    // Handle rate limit (same IP, cooldown) gracefully
-    if (r.status === 429) {
-      if (data?.endsAt) setTimer(Date.parse(data.endsAt));
-      if (data?.code && el.code) el.code.textContent = data.code;
-      setMsg(data?.message || 'This offer was already claimed from your network.');
-      // leave Apply enabled so user can still apply the returned code
-      if (el.apply) el.apply.disabled = false;
-      return;
-    }
+  // ======================================
+  // 1) Establish an immediate local end
+  // ======================================
+  let end = nowMs() + HOURS*60*60*1000; // fallback 48h from now
 
-    if (!r.ok || !data?.code || !(data.endsAt || data.expiresAt)) {
-      setMsg(`Could not create code${r.status ? ` (${r.status})` : ''}.`);
+  // if a prior deadline is saved and is close to 48h window, reuse it (prevents flicker)
+  const prior = loadDeadline();
+  if (prior > nowMs() && Math.abs(prior - end) < 10*60*1000) {
+    end = prior;
+  } else {
+    saveDeadline(end);
+  }
+
+  // Paint right away
+  paintDigits(end - nowMs());
+  syncCustomTimer(end);
+
+  // Drive the digits like before
+  const tmr = setInterval(() => {
+    const diff = end - nowMs();
+    paintDigits(diff);
+    if (diff <= 0) {
+      setMsg('Offer expired.');
       if (el.apply) el.apply.disabled = true;
-      return;
+      clearInterval(tmr);
+    }
+  }, 250);
+
+  // ====================================================
+  // 2) Claim/Reclaim (with server-sync of true endsAt)
+  // ====================================================
+  async function claim() {
+    // If we already created a code for this visitor and it hasn't expired, reuse it
+    const saved = loadCodeCache();
+    const savedEndMs = Date.parse(saved?.expiresAt || '');
+    if (saved && saved.code && savedEndMs > nowMs()) {
+      console.info('[thankyouclaim] using cached code', saved.code, 'exp:', saved.expiresAt);
+      if (el.code) el.code.textContent = saved.code;
+      setMsg('Code created. Expires at ' + fmtInTZ(savedEndMs));
+      // make sure our timer is synced to cached expiry
+      end = savedEndMs;
+      saveDeadline(end);
+      syncCustomTimer(end);
+      return saved;
     }
 
-    // TRUST THE SERVER: sync countdown and cache
-    const serverEndMs = Date.parse(data.endsAt || data.expiresAt);
-    setTimer(serverEndMs);
+    // Ask your API to mint / return a code. We send our current local end,
+    // but the server may return an earlier endsAt (for IP-lock consistency).
+    const body = { expiresAt: new Date(end).toISOString() };
+    console.info('[thankyouclaim] POST', API_URL, body);
 
-    if (el.code) el.code.textContent = data.code;
-    setMsg('Code created. Expires at ' + fmt(serverEndMs));
-
+    let r, data = {};
     try {
-      localStorage.setItem(CODE_KEY, JSON.stringify({
-        code: data.code,
-        expiresAt: new Date(serverEndMs).toISOString()
-      }));
-    } catch {}
-  })();
+      r = await fetch(API_URL, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
+      try { data = await r.json(); } catch {}
+      console.info('[thankyouclaim] response', r?.status, data);
+    } catch (e) {
+      console.warn('[thankyouclaim] network error', e);
+      setMsg('Could not create code.');
+      if (el.apply) el.apply.disabled = true;
+      return null;
+    }
 
-  // ====== 3) Buttons ======
-  if (el.apply) {
-    el.apply.addEventListener('click', () => {
-      let code = (el.code?.textContent || '').trim();
-      if (!code || code.includes('—')) {
-        try {
-          const saved = JSON.parse(localStorage.getItem(CODE_KEY) || 'null');
-          code = saved?.code || '';
-        } catch {}
+    // Friendly handling for IP cooldown/rate-limit
+    if (r.status === 429) {
+      const serverEnd = Date.parse(data?.endsAt || data?.expiresAt || '');
+      if (data?.code && el.code) el.code.textContent = data.code;
+      if (serverEnd) {
+        end = serverEnd;             // <-- CRITICAL: always trust server
+        saveDeadline(end);
+        syncCustomTimer(end);
+        setMsg((data?.message || 'This offer was already claimed from your network.') + ' Expires at ' + fmtInTZ(end));
+      } else {
+        setMsg(data?.message || 'This offer was already claimed from your network.');
       }
-      if (!code) return;
-      window.location.href = `/discount/${encodeURIComponent(code)}?redirect=/collections/all`;
-    });
+      // allow applying if we have a code
+      if (el.apply && data?.code) el.apply.disabled = false;
+      return null;
+    }
+
+    if (!r.ok || !data?.code) {
+      setMsg('Could not create code' + (r?.status ? ` (${r.status})` : ''));
+      if (el.apply) el.apply.disabled = true;
+      return null;
+    }
+
+    // ---- SUCCESS: show code + sync timer to server-provided endsAt ----
+    const serverEnd = Date.parse(data.endsAt || data.expiresAt || end);
+    if (el.code) el.code.textContent = data.code;
+    end = serverEnd;                 // <-- CRITICAL: always trust server
+    saveDeadline(end);
+    syncCustomTimer(end);
+
+    setMsg('Code created. Expires at ' + fmtInTZ(end));
+    saveCodeCache(data.code, new Date(end).toISOString());
+    return data;
   }
 
-  if (el.copy) {
-    el.copy.addEventListener('click', async () => {
-      const code = (el.code?.textContent || '').trim();
-      if (!code || code.includes('—')) return;
-      try {
-        await navigator.clipboard.writeText(code);
-        el.copy.textContent = 'Copied!';
-        setTimeout(() => el.copy.textContent = 'Copy code', 1200);
-      } catch {}
-    });
-  }
+  claim();
+
+  // =========================
+  // Buttons (same as before)
+  // =========================
+  el.apply && el.apply.addEventListener('click', () => {
+    const saved = loadCodeCache();
+    const code  = (saved && saved.code) || (el.code?.textContent || '').trim();
+    if (!code || code.includes('—')) return;
+    window.location.href = `/discount/${encodeURIComponent(code)}?redirect=/collections/all`;
+  });
+
+  el.copy && el.copy.addEventListener('click', async () => {
+    const code = (el.code?.textContent || '').trim();
+    if (!code || code.includes('—')) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      el.copy.textContent='Copied!';
+      setTimeout(()=> el.copy.textContent='Copy code', 1200);
+    } catch(e){}
+  });
 })();
 </script>
