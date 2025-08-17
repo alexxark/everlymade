@@ -96,21 +96,47 @@ function genCode(prefix = 'TY') {
   return `${prefix}-${slug}`;
 }
 
-function isPrivate(ip) {
+function isPrivateIp(ip) {
   return /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[0-1])\.|^127\.|^::1$|^fc00:|^fe80:/.test(ip);
 }
+
+// UPDATED: more robust client IP resolver with safe fallback
 function getClientIp(req) {
-  const cf = req.headers['cf-connecting-ip'];
-  if (cf && typeof cf === 'string') return cf.trim();
-  const trueClient = req.headers['true-client-ip'];
-  if (trueClient && typeof trueClient === 'string') return trueClient.trim();
-  const xff = req.headers['x-forwarded-for'];
-  if (typeof xff === 'string' && xff.length) {
-    const parts = xff.split(',').map(s => s.trim()).filter(Boolean);
-    for (const part of parts) if (!isPrivate(part)) return part;
-    return parts[0];
+  const pick = val => (typeof val === 'string' && val.trim()) ? val.trim() : '';
+
+  // Prefer well-known proxy/CDN headers
+  const cf = pick(req.headers['cf-connecting-ip']);
+  if (cf) return cf;
+
+  const tci = pick(req.headers['true-client-ip']);
+  if (tci) return tci;
+
+  const vff = pick(req.headers['x-vercel-forwarded-for']);
+  if (vff) {
+    const ip = vff.split(',')[0].trim().replace(/^::ffff:/, '');
+    if (ip) return ip;
   }
-  return req.headers['x-real-ip'] || req.socket?.remoteAddress || '0.0.0.0';
+
+  const xff = pick(req.headers['x-forwarded-for']);
+  if (xff) {
+    const parts = xff.split(',').map(s => s.trim()).filter(Boolean).map(s => s.replace(/^::ffff:/, ''));
+    for (const ip of parts) {
+      if (!isPrivateIp(ip)) return ip;
+    }
+    if (parts.length) return parts[0];
+  }
+
+  const xr = pick(req.headers['x-real-ip']);
+  if (xr) return xr.replace(/^::ffff:/, '');
+
+  const sock = pick(req.socket?.remoteAddress);
+  if (sock) return sock.replace(/^::ffff:/, '');
+
+  // LAST RESORT: synthesize a pseudo-identifier so one user doesn't lock everyone.
+  const ua = pick(req.headers['user-agent']);
+  const al = pick(req.headers['accept-language']);
+  const pseudo = crypto.createHash('sha1').update(ua + '|' + al).digest('hex').slice(0, 8);
+  return `0.0.0.${parseInt(pseudo.slice(0, 2), 16)}`; // pseudo, but not universal
 }
 
 function hmacHash(input, salt = IP_HASH_SALT) {
@@ -279,7 +305,7 @@ module.exports = async (req, res) => {
     }
 
     // Keys & period
-    const ip = getClientIp(req);
+    const ip = getClientIp(req);              // UPDATED resolver
     const ipHash = hmacHash(ip);
     const periodStart = getPeriodStart(now);
     const periodEndsAt = getPeriodEnd(now, PERIOD_MONTHS);
@@ -291,7 +317,7 @@ module.exports = async (req, res) => {
     const kvKeyEverIp     = `ty:ip:ever:${ipHash}`;
     const kvKeyCustPeriod = customerKeyHash ? `ty:cust:period:${PERIOD_MONTHS}m:${periodLabel}:${customerKeyHash}` : null;
     const kvKeyCustEver   = customerKeyHash ? `ty:cust:ever:${customerKeyHash}` : null;
-    const kvKeyGuestPeriod = `ty:guest:period:${PERIOD_MONTHS}m:${periodLabel}:${ipHash}`; // use for mirror + guest
+    const kvKeyGuestPeriod = `ty:guest:period:${PERIOD_MONTHS}m:${periodLabel}:${ipHash}`; // guest + mirror
 
     // STRICT once
     if (STRICT_ONCE) {
@@ -432,8 +458,8 @@ module.exports = async (req, res) => {
         error: 'already_claimed_monthly',
         message: 'You have already claimed this offer for the current period.',
         periodEndsAt: periodEndsAt.toISOString(),
-        code: checkGuest.code,          // the prior/kept code (if you choose to display it)
-        revokedNewMint: true,           // <-- FE: hide/cancel the newly shown code
+        code: checkGuest.code,
+        revokedNewMint: true,
         reused: true
       });
     }
@@ -458,7 +484,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // Cookie for same-browser damping
+    // Cookie for same-browser damping (will usually be 3rd-party on Shopify → best-effort)
     const cookieMaxAge = STRICT_ONCE ? 10 * 365 * 24 * 3600 : ttlSecActive;
     setCookie(res, 'ty_claimed', '1', { maxAgeSec: cookieMaxAge });
 
