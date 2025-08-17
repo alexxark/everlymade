@@ -1,11 +1,22 @@
-// api/thankyouclaim.js — CommonJS (Vercel /api/*) — REST-only Upstash (no deps)
-// - Uses NX + EX (relative TTL) for monthly locks (no EXAT)
-// - Includes ?connect=1 probe and ?debug=1 dry-run
-// - Supports HASH_IP_WITH_UA to reduce POP collisions
+// api/thankyouclaim.js — CommonJS (Vercel /api/*) — per-visitor monthly key + EX/NX
+// Order of enforcement: active IP window (48h) → monthly limit (visitor/customer) → mint
+//
+// ENV VARS (Vercel):
+//   SHOPIFY_SHOP, SHOPIFY_ADMIN_TOKEN
+//   UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
+//   IP_HASH_SALT
+//   TY_PERCENT               (default 20)
+//   TY_COOLDOWN_HOURS        (default 0)
+//   PERIOD_MONTHS            (default 1)   // calendar months
+//   REQUIRE_SIGNED_IN        (default false)
+//   STRICT_ONCE              (default false)
+//   EVER_TTL_DAYS            (default 0)   // 0 = persist
+//   REQUIRE_REAL_IP_FOR_GUEST (default false)
+//   HASH_IP_WITH_UA          (default false) // reduce POP/CDN IP collisions
 
 const crypto = require('crypto');
 
-// ---------- Env ----------
+// ----- Config -----
 const SHOPIFY_SHOP        = process.env.SHOPIFY_SHOP;
 const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const API_VERSION         = '2025-07';
@@ -26,11 +37,9 @@ const EVER_TTL_DAYS = parseFloat(process.env.EVER_TTL_DAYS || '0') || 0;
 const REQUIRE_REAL_IP_FOR_GUEST = String(process.env.REQUIRE_REAL_IP_FOR_GUEST || 'false').toLowerCase() === 'true';
 const HASH_IP_WITH_UA           = String(process.env.HASH_IP_WITH_UA || 'false').toLowerCase() === 'true';
 
-// ---------- Upstash REST helpers ----------
-function okUpstash() { return Boolean(UPSTASH_URL && UPSTASH_TOKEN); }
-
+// ----- Upstash helpers -----
 async function kvGet(key) {
-  if (!okUpstash() || !key) return null;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN || !key) return null;
   const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
     cache: 'no-store',
@@ -39,61 +48,55 @@ async function kvGet(key) {
   const data = await r.json().catch(() => null);
   try { return data?.result ? JSON.parse(data.result) : null; } catch { return data?.result ?? null; }
 }
-async function kvSet(key, value) {
-  if (!okUpstash()) return false;
-  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}`;
-  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
-  return r.ok;
-}
+
 async function kvSetEx(key, value, ttlSeconds) {
-  if (!okUpstash()) return false;
-  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${Math.max(1, Math.floor(ttlSeconds))}`;
-  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${encodeURIComponent(ttlSeconds)}`;
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
   return r.ok;
 }
+
 async function kvSetNxEx(key, value, ttlSeconds) {
-  if (!okUpstash()) return false;
-  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${Math.max(1, Math.floor(ttlSeconds))}&NX=1`;
-  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${encodeURIComponent(ttlSeconds)}&NX=1`;
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
   if (!r.ok) return false;
   const data = await r.json().catch(() => null);
-  return data?.result === 'OK'; // false if key existed
+  return data?.result === 'OK';
 }
+
 async function kvDel(key) {
-  if (!okUpstash() || !key) return false;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN || !key) return false;
   const url = `${UPSTASH_URL}/del/${encodeURIComponent(key)}`;
-  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
   return r.ok;
 }
+
+async function kvSet(key, value) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}`;
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
+  return r.ok;
+}
+
 async function kvSetExDays(key, value, days) {
   if (days <= 0) return kvSet(key, value);
-  const ttlSeconds = Math.floor(days * 86400);
+  const ttlSeconds = Math.max(1, Math.floor(days * 86400));
   return kvSetEx(key, value, ttlSeconds);
 }
 
-// Quick probe: set/get/del a temp key using EX=10
-async function kvProbe() {
-  if (!okUpstash()) throw new Error('Missing UPSTASH_URL/TOKEN');
-  const tmp = `ty:probe:${Date.now()}:${Math.random().toString(36).slice(2,8)}`;
-  const setUrl = `${UPSTASH_URL}/set/${encodeURIComponent(tmp)}/${encodeURIComponent('ok')}?EX=10`;
-  const setR = await fetch(setUrl, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
-  if (!setR.ok) throw new Error(`SET failed HTTP ${setR.status}`);
-  const getR = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(tmp)}`, { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
-  const getJ = await getR.json().catch(()=>({}));
-  await fetch(`${UPSTASH_URL}/del/${encodeURIComponent(tmp)}`, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
-  return getJ?.result === 'ok';
-}
-
-// ---------- Utils ----------
+// ----- Utils -----
 function genCode(prefix = 'TY') {
-  const pool = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const pool = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
   let four = '';
   for (let i = 0; i < 4; i++) four += pool[Math.floor(Math.random() * pool.length)];
   return `${prefix}-${four}`;
 }
+
 function isPrivateIp(ip) {
   return /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[0-1])\.|^127\.|^::1$|^fc00:|^fe80:/.test(ip);
 }
+
 function getClientIpDetailed(req) {
   const pick = v => (typeof v === 'string' && v.trim()) ? v.trim() : '';
   const cf  = pick(req.headers['cf-connecting-ip']);        if (cf)  return { ip: cf, kind: 'cf'  };
@@ -107,14 +110,14 @@ function getClientIpDetailed(req) {
   }
   const xr = pick(req.headers['x-real-ip']);                if (xr)  return { ip: xr.replace(/^::ffff:/, ''), kind: 'xr' };
   const sock = pick(req.socket?.remoteAddress);             if (sock) return { ip: sock.replace(/^::ffff:/, ''), kind: 'sock' };
-  const ua = pick(req.headers['user-agent']);
-  const al = pick(req.headers['accept-language']);
-  const pseudo = crypto.createHash('sha1').update(ua + '|' + al).digest('hex').slice(0, 12);
-  return { ip: `pseudo:${pseudo}`, kind: 'pseudo' };
+  // No real IP — will fall back to a first-party cookie visitor id
+  return { ip: 'pseudo', kind: 'pseudo' };
 }
+
 function hmacHash(input, salt = IP_HASH_SALT) {
   return crypto.createHmac('sha256', salt).update(String(input)).digest('hex');
 }
+
 function parseCookies(req) {
   const h = req.headers.cookie || '';
   return h.split(';').reduce((acc, part) => {
@@ -124,12 +127,14 @@ function parseCookies(req) {
     return acc;
   }, {});
 }
+
 function appendHeader(res, name, value) {
   const prev = res.getHeader(name);
   if (!prev) return res.setHeader(name, value);
   if (Array.isArray(prev)) return res.setHeader(name, prev.concat(value));
   return res.setHeader(name, [prev, value]);
 }
+
 function setCookie(res, name, value, { maxAgeSec, path='/', httpOnly=true, sameSite='Lax', secure=true } = {}) {
   const parts = [`${name}=${encodeURIComponent(value)}`, `Path=${path}`, `SameSite=${sameSite}`];
   if (httpOnly) parts.push('HttpOnly');
@@ -137,7 +142,7 @@ function setCookie(res, name, value, { maxAgeSec, path='/', httpOnly=true, sameS
   if (Number.isFinite(maxAgeSec)) parts.push(`Max-Age=${Math.max(0, Math.floor(maxAgeSec))}`);
   appendHeader(res, 'Set-Cookie', parts.join('; '));
 }
-// Calendar helpers
+
 function addMonths(date, n) {
   const d = new Date(date);
   const m = d.getMonth();
@@ -145,11 +150,23 @@ function addMonths(date, n) {
   if (d.getMonth() !== ((m + n) % 12 + 12) % 12) d.setDate(0);
   return d;
 }
-function getPeriodStart(now) { const d = new Date(now); d.setUTCDate(1); d.setUTCHours(0,0,0,0); return d; }
-function getPeriodEnd(now, months) { return addMonths(getPeriodStart(now), months); }
-function secondsUntil(fromMs, dateTo) { const ms = Math.max(0, dateTo.getTime() - fromMs); return Math.ceil(ms / 1000); }
+function getPeriodStart(nowMs) { const d = new Date(nowMs); d.setUTCDate(1); d.setUTCHours(0,0,0,0); return d; }
+function getPeriodEnd(nowMs, months) { return addMonths(getPeriodStart(nowMs), months); }
+function secondsUntil(fromMs, toDate) { return Math.max(1, Math.ceil((toDate.getTime() - fromMs)/1000)); }
 
-// ---------- Shopify helpers ----------
+// ----- Visitor identity (per-browser fallback) -----
+function getOrCreateVisitorId(req, res) {
+  const cookies = parseCookies(req);
+  let vid = cookies['ty_vid'];
+  if (!vid || !/^[a-z0-9-]{12,}$/.test(vid)) {
+    // simple uuid-ish
+    vid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,10)}`;
+    setCookie(res, 'ty_vid', vid, { maxAgeSec: 365*24*3600, httpOnly: true, sameSite: 'Lax', secure: true });
+  }
+  return vid;
+}
+
+// ----- Shopify helpers -----
 async function shopifyGraphQL(query, variables) {
   const r = await fetch(`https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`, {
     method: 'POST',
@@ -159,6 +176,7 @@ async function shopifyGraphQL(query, variables) {
   const data = await r.json().catch(() => ({}));
   return { ok: r.ok, data, status: r.status };
 }
+
 async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
   const mutation = `
     mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
@@ -192,6 +210,7 @@ async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
   if (!node) throw new Error('No codeDiscountNode returned');
   return node.id;
 }
+
 async function deleteDiscountByNodeId(nodeId) {
   const mutation = `
     mutation discountCodeDelete($id: ID!) {
@@ -207,12 +226,16 @@ async function deleteDiscountByNodeId(nodeId) {
   return true;
 }
 
-// ---------- Debug helpers ----------
+// ----- Debug helpers -----
 function setDebugHeaders(res, obj = {}) {
   for (const [k, v] of Object.entries(obj)) {
     if (v == null) continue;
     res.setHeader(`X-TY-${k}`, typeof v === 'string' ? v : JSON.stringify(v));
   }
+  // expose them cross-origin so fetch(...).headers.get() works
+  res.setHeader('Access-Control-Expose-Headers', [
+    'X-TY-ipKind','X-TY-ipHash','X-TY-guestMonthKey','X-TY-custMonthKey','X-TY-activeIpKey','X-TY-upstashUrlHash'
+  ].join(', '));
 }
 function getDebugFlag(req, body) {
   try {
@@ -223,14 +246,8 @@ function getDebugFlag(req, body) {
     return Boolean(inQuery || inBody);
   } catch { return false; }
 }
-function getConnectProbe(req) {
-  try {
-    const url = req.url ? new URL(req.url, 'http://localhost') : null;
-    return url?.searchParams.get('connect') === '1';
-  } catch { return false; }
-}
 
-// ---------- Handler ----------
+// ----- Handler -----
 module.exports = async (req, res) => {
   // CORS
   if (req.method === 'OPTIONS') {
@@ -247,17 +264,6 @@ module.exports = async (req, res) => {
 
     const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
     const DEBUG = getDebugFlag(req, body);
-    const PROBE = getConnectProbe(req);
-
-    // Probe Upstash connectivity quickly
-    if (PROBE) {
-      try {
-        const ok = await kvProbe();
-        return res.status(200).json({ ok, client: 'rest', exMode: 'EX+NX' });
-      } catch (e) {
-        return res.status(502).json({ ok: false, error: 'connect-failed', message: String(e?.message || e) });
-      }
-    }
 
     const clientExpiresAtIso = body?.expiresAt;
     const customerIdRaw      = body?.customerId || null;
@@ -271,16 +277,15 @@ module.exports = async (req, res) => {
       return res.status(401).json({ error: 'signin_required', reason: 'signin_required' });
     }
 
-    // Customer identity (optional)
+    // Normalize customer identity
     let customerKeyHash = null;
     if (customerIdRaw) customerKeyHash = hmacHash(`id:${String(customerIdRaw).trim()}`);
     else if (customerEmailRaw) customerKeyHash = hmacHash(`email:${String(customerEmailRaw).trim().toLowerCase()}`);
 
     const now = Date.now();
     const startsAt = new Date(now);
-    const serverDefaultEnd = new Date(now + 48 * 60 * 60 * 1000);
+    const serverDefaultEnd = new Date(now + 48 * 3600 * 1000);
 
-    // Honor shorter client expiry
     let chosenEndsAt = serverDefaultEnd;
     if (clientExpiresAtIso) {
       const clientEndMs = Date.parse(clientExpiresAtIso);
@@ -289,46 +294,53 @@ module.exports = async (req, res) => {
       }
     }
 
-    // IP + hash
+    // Identity: IP (preferred) else visitor cookie
     const ipInfo = getClientIpDetailed(req);
     const hasRealIp = ipInfo.kind !== 'pseudo';
     const uaForHash = (req.headers['user-agent'] || '').toString().slice(0, 200);
-    const ipHash = hasRealIp ? hmacHash(HASH_IP_WITH_UA ? `${ipInfo.ip}|${uaForHash}` : ipInfo.ip) : null;
+    const visitorCookie = getOrCreateVisitorId(req, res);
 
-    // Period + keys
+    const ipHash = hasRealIp ? hmacHash(HASH_IP_WITH_UA ? `${ipInfo.ip}|${uaForHash}` : ipInfo.ip) : null;
+    // Per-visitor monthly identity (covers CDN shared IPs, VPN, etc.)
+    const visitorHash = hasRealIp
+      ? ipHash                           // real IP (optionally salted by UA)
+      : hmacHash(`vid:${visitorCookie}`);// fallback to cookie id
+
     const periodStart = getPeriodStart(now);
     const periodEndsAt = getPeriodEnd(now, PERIOD_MONTHS);
-    const periodLabel = `${periodStart.getUTCFullYear()}${String(periodStart.getUTCMonth() + 1).padStart(2,'0')}`;
+    const ttlSecPeriod = secondsUntil(now, periodEndsAt);
+    const cy = periodStart.getUTCFullYear();
+    const cm = String(periodStart.getUTCMonth() + 1).padStart(2, '0');
+    const periodLabel = `${cy}${cm}`;
 
+    // Keys
     const kvKeyActiveIp    = hasRealIp ? `ty:ip:${ipHash}` : null;
     const kvKeyEverIp      = hasRealIp ? `ty:ip:ever:${ipHash}` : null;
-    const kvKeyGuestPeriod = hasRealIp ? `ty:guest:period:${PERIOD_MONTHS}m:${periodLabel}:${ipHash}` : null;
+
+    const kvKeyGuestPeriod = `ty:guest:period:${PERIOD_MONTHS}m:${periodLabel}:${visitorHash}`;
     const kvKeyCustPeriod  = customerKeyHash ? `ty:cust:period:${PERIOD_MONTHS}m:${periodLabel}:${customerKeyHash}` : null;
     const kvKeyCustEver    = customerKeyHash ? `ty:cust:ever:${customerKeyHash}` : null;
 
     setDebugHeaders(res, {
       ipKind: ipInfo.kind,
       ipHash,
-      hashWithUA: String(HASH_IP_WITH_UA),
-      periodLabel,
       guestMonthKey: kvKeyGuestPeriod,
       custMonthKey: kvKeyCustPeriod,
-      activeIpKey: kvKeyActiveIp,
-      upstashUrlHash: (UPSTASH_URL||'').slice(0,40)
+      activeIpKey: kvKeyActiveIp
     });
 
-    // Guests must have real IP if required
     if (!hasRealIp && !customerKeyHash && REQUIRE_REAL_IP_FOR_GUEST) {
+      setDebugHeaders(res, { reason: 'no-real-ip-and-guest' });
       return res.status(401).json({ error: 'signin_required', reason: 'no-real-ip-and-guest' });
     }
 
-    // Dry-run debug (no writes)
+    // DEBUG path — no writes
     if (DEBUG) {
-      const existingGuest = kvKeyGuestPeriod ? await kvGet(kvKeyGuestPeriod) : null;
-      const existingCust  = kvKeyCustPeriod  ? await kvGet(kvKeyCustPeriod)  : null;
-      const existingAct   = kvKeyActiveIp    ? await kvGet(kvKeyActiveIp)    : null;
-      const existingEverI = kvKeyEverIp      ? await kvGet(kvKeyEverIp)      : null;
-      const existingEverC = kvKeyCustEver    ? await kvGet(kvKeyCustEver)    : null;
+      const existingGuest = await kvGet(kvKeyGuestPeriod);
+      const existingCust  = kvKeyCustPeriod ? await kvGet(kvKeyCustPeriod) : null;
+      const existingAct   = kvKeyActiveIp ? await kvGet(kvKeyActiveIp) : null;
+      const existingEverI = kvKeyEverIp ? await kvGet(kvKeyEverIp) : null;
+      const existingEverC = kvKeyCustEver ? await kvGet(kvKeyCustEver) : null;
 
       const wouldBlock =
         (STRICT_ONCE && (browserClaimed || existingEverI || existingEverC)) ||
@@ -356,21 +368,20 @@ module.exports = async (req, res) => {
       });
     }
 
-    // STRICT once-ever
+    // STRICT once: browser then IP/customer
     if (STRICT_ONCE) {
       if (browserClaimed) return res.status(429).json({ error: 'already_claimed', reason: 'browser-cookie' });
-      if (hasRealIp) {
+      if (hasRealIp && kvKeyEverIp) {
         const everIp = await kvGet(kvKeyEverIp);
         if (everIp) return res.status(429).json({ error: 'already_claimed', reason: 'ip-ever-lock' });
       }
-      if (customerKeyHash) {
+      if (customerKeyHash && kvKeyCustEver) {
         const everCust = await kvGet(kvKeyCustEver);
         if (everCust) return res.status(429).json({ error: 'already_claimed_customer', reason: 'customer-ever-lock' });
       }
     }
 
-    // --------- Monthly reservation (EX + NX with TTL until end-of-month) ---------
-    const ttlSecPeriod = secondsUntil(now, periodEndsAt);
+    // ----- ATOMIC monthly reservation (per visitor) -----
     const monthPayload = (marker) => ({
       code: null, marker,
       firstClaimAt: new Date(now).toISOString(),
@@ -381,12 +392,7 @@ module.exports = async (req, res) => {
     let reservedKeys = [];
 
     if (customerKeyHash && kvKeyCustPeriod) {
-      let ok1;
-      try {
-        ok1 = await kvSetNxEx(kvKeyCustPeriod, monthPayload('cust-reserve'), ttlSecPeriod);
-      } catch (e) {
-        return res.status(502).json({ error: 'kv-write-failed', where: 'customer-monthly', message: String(e?.message || e) });
-      }
+      const ok1 = await kvSetNxEx(kvKeyCustPeriod, monthPayload('cust-reserve'), ttlSecPeriod);
       if (!ok1) {
         const existing = await kvGet(kvKeyCustPeriod);
         return res.status(429).json({
@@ -399,50 +405,37 @@ module.exports = async (req, res) => {
       }
       reservedKeys.push(kvKeyCustPeriod);
 
-      if (hasRealIp && kvKeyGuestPeriod) {
-        let ok2;
-        try {
-          ok2 = await kvSetNxEx(kvKeyGuestPeriod, monthPayload('mirror'), ttlSecPeriod);
-        } catch (e) {
-          await kvDel(kvKeyCustPeriod);
-          return res.status(502).json({ error: 'kv-write-failed', where: 'mirror-guest', message: String(e?.message || e) });
-        }
-        if (!ok2) {
-          await kvDel(kvKeyCustPeriod);
-          const existing = await kvGet(kvKeyGuestPeriod);
-          return res.status(429).json({
-            error: 'already_claimed_monthly',
-            reason: 'monthly-lock-guest',
-            periodEndsAt: periodEndsAt.toISOString(),
-            code: existing?.code || undefined,
-            reused: true
-          });
-        }
-        reservedKeys.push(kvKeyGuestPeriod);
+      // Mirror to guest key so browser swap on same visitor cannot bypass
+      const ok2 = await kvSetNxEx(kvKeyGuestPeriod, monthPayload('mirror'), ttlSecPeriod);
+      if (!ok2) {
+        await kvDel(kvKeyCustPeriod);
+        const existing = await kvGet(kvKeyGuestPeriod);
+        return res.status(429).json({
+          error: 'already_claimed_monthly',
+          reason: 'monthly-lock-guest',
+          periodEndsAt: periodEndsAt.toISOString(),
+          code: existing?.code || undefined,
+          reused: true
+        });
       }
+      reservedKeys.push(kvKeyGuestPeriod);
     } else {
-      if (hasRealIp && kvKeyGuestPeriod) {
-        let ok;
-        try {
-          ok = await kvSetNxEx(kvKeyGuestPeriod, monthPayload('guest-reserve'), ttlSecPeriod);
-        } catch (e) {
-          return res.status(502).json({ error: 'kv-write-failed', where: 'guest-monthly', message: String(e?.message || e) });
-        }
-        if (!ok) {
-          const existing = await kvGet(kvKeyGuestPeriod);
-          return res.status(429).json({
-            error: 'already_claimed_monthly',
-            reason: 'monthly-lock-guest',
-            periodEndsAt: periodEndsAt.toISOString(),
-            code: existing?.code || undefined,
-            reused: true
-          });
-        }
-        reservedKeys.push(kvKeyGuestPeriod);
+      // Guest monthly using per-visitor key
+      const ok = await kvSetNxEx(kvKeyGuestPeriod, monthPayload('guest-reserve'), ttlSecPeriod);
+      if (!ok) {
+        const existing = await kvGet(kvKeyGuestPeriod);
+        return res.status(429).json({
+          error: 'already_claimed_monthly',
+          reason: 'monthly-lock-guest',
+          periodEndsAt: periodEndsAt.toISOString(),
+          code: existing?.code || undefined,
+          reused: true
+        });
       }
+      reservedKeys.push(kvKeyGuestPeriod);
     }
 
-    // --------- Active IP reuse/cooldown (48h) ---------
+    // ----- Active IP reuse/cooldown (48h) -----
     if (hasRealIp && kvKeyActiveIp) {
       const existing = await kvGet(kvKeyActiveIp);
       if (existing) {
@@ -470,7 +463,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // --------- Mint ---------
+    // ----- Mint -----
     let code = null, nodeId = null;
     for (let attempt = 1; attempt <= 5; attempt++) {
       const tryCode = genCode('TY');
@@ -493,18 +486,28 @@ module.exports = async (req, res) => {
       return res.status(502).json({ error: 'Failed to create discount code' });
     }
 
-    // --------- Finalize monthly records (EX with same TTL) ---------
-    const monthlyRecord = { code, nodeId, firstClaimAt: new Date(now).toISOString(), periodEndsAt: periodEndsAt.toISOString() };
-    const ttlAgain = secondsUntil(Date.now(), periodEndsAt);
-    try {
-      if (hasRealIp && kvKeyGuestPeriod) await kvSetEx(kvKeyGuestPeriod, monthlyRecord, ttlAgain);
-      if (customerKeyHash && kvKeyCustPeriod) await kvSetEx(kvKeyCustPeriod, monthlyRecord, ttlAgain);
-    } catch (e) {
+    // ----- Persist monthly record(s) -----
+    const monthlyRecord = {
+      code, nodeId,
+      firstClaimAt: new Date(now).toISOString(),
+      periodEndsAt: periodEndsAt.toISOString()
+    };
+    await kvSet(kvKeyGuestPeriod, monthlyRecord);
+    if (customerKeyHash && kvKeyCustPeriod) await kvSet(kvKeyCustPeriod, monthlyRecord);
+
+    // Race check (defensive)
+    const checkGuest = await kvGet(kvKeyGuestPeriod);
+    if (checkGuest && checkGuest.code && checkGuest.code !== code) {
       try { await deleteDiscountByNodeId(nodeId); } catch {}
-      return res.status(502).json({ error: 'kv-write-failed', where: 'finalize-monthly', message: String(e?.message || e) });
+      return res.status(429).json({
+        error: 'already_claimed_monthly',
+        reason: 'monthly-lock-race',
+        periodEndsAt: periodEndsAt.toISOString(),
+        code: checkGuest.code, revokedNewMint: true, reused: true, ipKind: ipInfo.kind
+      });
     }
 
-    // --------- Active IP lock (48h + cooldown) ---------
+    // ----- Active IP lock (48h + cooldown) -----
     if (hasRealIp && kvKeyActiveIp) {
       const ttlSecActive =
         Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000)) +
@@ -514,7 +517,7 @@ module.exports = async (req, res) => {
       }, ttlSecActive);
     }
 
-    // --------- Ever locks (optional) ---------
+    // Strict once-ever (optional)
     if (STRICT_ONCE && hasRealIp && kvKeyEverIp) {
       await kvSetExDays(kvKeyEverIp, { code, firstClaimAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId }, EVER_TTL_DAYS);
       if (customerKeyHash && kvKeyCustEver) {
@@ -522,11 +525,16 @@ module.exports = async (req, res) => {
       }
     }
 
-    // Browser cookie (soft)
+    // Browser dampening cookie
     const cookieMaxAge = STRICT_ONCE ? 10 * 365 * 24 * 3600 : Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000));
     setCookie(res, 'ty_claimed', '1', { maxAgeSec: cookieMaxAge });
 
-    setDebugHeaders(res, { reason: 'minted', code, nodeId, endsAt: chosenEndsAt.toISOString(), ipKind: ipInfo.kind });
+    setDebugHeaders(res, {
+      reason: 'minted',
+      code, nodeId,
+      endsAt: chosenEndsAt.toISOString(),
+      ipKind: ipInfo.kind
+    });
 
     return res.status(200).json({
       ok: true, reason: 'minted',
@@ -535,13 +543,13 @@ module.exports = async (req, res) => {
       endsAt:   chosenEndsAt.toISOString(),
       nodeId,
       customerLimitedByMonths: customerKeyHash ? PERIOD_MONTHS : undefined,
-      guestLimitedByMonths: (!customerKeyHash && hasRealIp) ? PERIOD_MONTHS : undefined,
+      guestLimitedByMonths: PERIOD_MONTHS,
       ipKind: ipInfo.kind
     });
 
   } catch (e) {
     console.error('Unhandled error creating discount', e);
-    setDebugHeaders(res, { reason: 'server-error', error: String(e?.message || e), upstashUrlHash: (UPSTASH_URL||'').slice(0,40) });
+    setDebugHeaders(res, { reason: 'server-error', error: String(e?.message || e) });
     return res.status(500).json({ error: 'Unhandled error', message: e?.message || String(e) });
   }
 };
