@@ -1,5 +1,4 @@
-// api/thankyouclaim.js — CommonJS (Vercel /api/*) — per-visitor monthly key + EX/NX
-// Order of enforcement: active IP window (48h) → monthly limit (visitor/customer) → mint
+// api/thankyouclaim.js — CommonJS (Vercel /api/*) — per-visitor monthly key with selectable mode
 //
 // ENV VARS (Vercel):
 //   SHOPIFY_SHOP, SHOPIFY_ADMIN_TOKEN
@@ -7,16 +6,16 @@
 //   IP_HASH_SALT
 //   TY_PERCENT               (default 20)
 //   TY_COOLDOWN_HOURS        (default 0)
-//   PERIOD_MONTHS            (default 1)   // calendar months
+//   PERIOD_MONTHS            (default 1)
 //   REQUIRE_SIGNED_IN        (default false)
 //   STRICT_ONCE              (default false)
-//   EVER_TTL_DAYS            (default 0)   // 0 = persist
+//   EVER_TTL_DAYS            (default 0)
 //   REQUIRE_REAL_IP_FOR_GUEST (default false)
-//   HASH_IP_WITH_UA          (default false) // reduce POP/CDN IP collisions
+//   HASH_IP_WITH_UA          (default false)      // reduce POP collisions when using IP
+//   VISITOR_KEY_MODE         (default "cookie+ip") // one of: "cookie", "ip", "cookie+ip"
 
 const crypto = require('crypto');
 
-// ----- Config -----
 const SHOPIFY_SHOP        = process.env.SHOPIFY_SHOP;
 const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const API_VERSION         = '2025-07';
@@ -36,6 +35,7 @@ const EVER_TTL_DAYS = parseFloat(process.env.EVER_TTL_DAYS || '0') || 0;
 
 const REQUIRE_REAL_IP_FOR_GUEST = String(process.env.REQUIRE_REAL_IP_FOR_GUEST || 'false').toLowerCase() === 'true';
 const HASH_IP_WITH_UA           = String(process.env.HASH_IP_WITH_UA || 'false').toLowerCase() === 'true';
+const VISITOR_KEY_MODE          = String(process.env.VISITOR_KEY_MODE || 'cookie+ip').toLowerCase(); // "cookie" | "ip" | "cookie+ip"
 
 // ----- Upstash helpers -----
 async function kvGet(key) {
@@ -92,11 +92,9 @@ function genCode(prefix = 'TY') {
   for (let i = 0; i < 4; i++) four += pool[Math.floor(Math.random() * pool.length)];
   return `${prefix}-${four}`;
 }
-
 function isPrivateIp(ip) {
   return /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[0-1])\.|^127\.|^::1$|^fc00:|^fe80:/.test(ip);
 }
-
 function getClientIpDetailed(req) {
   const pick = v => (typeof v === 'string' && v.trim()) ? v.trim() : '';
   const cf  = pick(req.headers['cf-connecting-ip']);        if (cf)  return { ip: cf, kind: 'cf'  };
@@ -110,14 +108,11 @@ function getClientIpDetailed(req) {
   }
   const xr = pick(req.headers['x-real-ip']);                if (xr)  return { ip: xr.replace(/^::ffff:/, ''), kind: 'xr' };
   const sock = pick(req.socket?.remoteAddress);             if (sock) return { ip: sock.replace(/^::ffff:/, ''), kind: 'sock' };
-  // No real IP — will fall back to a first-party cookie visitor id
   return { ip: 'pseudo', kind: 'pseudo' };
 }
-
 function hmacHash(input, salt = IP_HASH_SALT) {
   return crypto.createHmac('sha256', salt).update(String(input)).digest('hex');
 }
-
 function parseCookies(req) {
   const h = req.headers.cookie || '';
   return h.split(';').reduce((acc, part) => {
@@ -127,14 +122,12 @@ function parseCookies(req) {
     return acc;
   }, {});
 }
-
 function appendHeader(res, name, value) {
   const prev = res.getHeader(name);
   if (!prev) return res.setHeader(name, value);
   if (Array.isArray(prev)) return res.setHeader(name, prev.concat(value));
   return res.setHeader(name, [prev, value]);
 }
-
 function setCookie(res, name, value, { maxAgeSec, path='/', httpOnly=true, sameSite='Lax', secure=true } = {}) {
   const parts = [`${name}=${encodeURIComponent(value)}`, `Path=${path}`, `SameSite=${sameSite}`];
   if (httpOnly) parts.push('HttpOnly');
@@ -142,7 +135,6 @@ function setCookie(res, name, value, { maxAgeSec, path='/', httpOnly=true, sameS
   if (Number.isFinite(maxAgeSec)) parts.push(`Max-Age=${Math.max(0, Math.floor(maxAgeSec))}`);
   appendHeader(res, 'Set-Cookie', parts.join('; '));
 }
-
 function addMonths(date, n) {
   const d = new Date(date);
   const m = d.getMonth();
@@ -154,16 +146,28 @@ function getPeriodStart(nowMs) { const d = new Date(nowMs); d.setUTCDate(1); d.s
 function getPeriodEnd(nowMs, months) { return addMonths(getPeriodStart(nowMs), months); }
 function secondsUntil(fromMs, toDate) { return Math.max(1, Math.ceil((toDate.getTime() - fromMs)/1000)); }
 
-// ----- Visitor identity (per-browser fallback) -----
+// ----- Visitor identity (browser cookie + optional IP) -----
 function getOrCreateVisitorId(req, res) {
   const cookies = parseCookies(req);
   let vid = cookies['ty_vid'];
   if (!vid || !/^[a-z0-9-]{12,}$/.test(vid)) {
-    // simple uuid-ish
     vid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,10)}`;
     setCookie(res, 'ty_vid', vid, { maxAgeSec: 365*24*3600, httpOnly: true, sameSite: 'Lax', secure: true });
   }
   return vid;
+}
+function makeVisitorHash({ mode, vid, hasRealIp, ip, ua }) {
+  // always stable per-browser thanks to vid; optionally include network bits
+  if (mode === 'cookie') {
+    return hmacHash(`vid:${vid}`);
+  }
+  if (mode === 'ip') {
+    const ipBase = hasRealIp ? (HASH_IP_WITH_UA ? `${ip}|${ua}` : ip) : 'noip';
+    return hmacHash(`ip:${ipBase}`);
+  }
+  // default "cookie+ip"
+  const ipPart = hasRealIp ? (HASH_IP_WITH_UA ? `${ip}|${ua}` : ip) : 'noip';
+  return hmacHash(`vid:${vid}|ip:${ipPart}`);
 }
 
 // ----- Shopify helpers -----
@@ -176,7 +180,6 @@ async function shopifyGraphQL(query, variables) {
   const data = await r.json().catch(() => ({}));
   return { ok: r.ok, data, status: r.status };
 }
-
 async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
   const mutation = `
     mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
@@ -210,7 +213,6 @@ async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
   if (!node) throw new Error('No codeDiscountNode returned');
   return node.id;
 }
-
 async function deleteDiscountByNodeId(nodeId) {
   const mutation = `
     mutation discountCodeDelete($id: ID!) {
@@ -232,9 +234,9 @@ function setDebugHeaders(res, obj = {}) {
     if (v == null) continue;
     res.setHeader(`X-TY-${k}`, typeof v === 'string' ? v : JSON.stringify(v));
   }
-  // expose them cross-origin so fetch(...).headers.get() works
   res.setHeader('Access-Control-Expose-Headers', [
-    'X-TY-ipKind','X-TY-ipHash','X-TY-guestMonthKey','X-TY-custMonthKey','X-TY-activeIpKey','X-TY-upstashUrlHash'
+    'X-TY-ipKind','X-TY-ipHash','X-TY-visitorHash','X-TY-visitorMode',
+    'X-TY-guestMonthKey','X-TY-custMonthKey','X-TY-activeIpKey'
   ].join(', '));
 }
 function getDebugFlag(req, body) {
@@ -277,7 +279,6 @@ module.exports = async (req, res) => {
       return res.status(401).json({ error: 'signin_required', reason: 'signin_required' });
     }
 
-    // Normalize customer identity
     let customerKeyHash = null;
     if (customerIdRaw) customerKeyHash = hmacHash(`id:${String(customerIdRaw).trim()}`);
     else if (customerEmailRaw) customerKeyHash = hmacHash(`email:${String(customerEmailRaw).trim().toLowerCase()}`);
@@ -294,17 +295,20 @@ module.exports = async (req, res) => {
       }
     }
 
-    // Identity: IP (preferred) else visitor cookie
+    // Identity
     const ipInfo = getClientIpDetailed(req);
     const hasRealIp = ipInfo.kind !== 'pseudo';
     const uaForHash = (req.headers['user-agent'] || '').toString().slice(0, 200);
-    const visitorCookie = getOrCreateVisitorId(req, res);
-
     const ipHash = hasRealIp ? hmacHash(HASH_IP_WITH_UA ? `${ipInfo.ip}|${uaForHash}` : ipInfo.ip) : null;
-    // Per-visitor monthly identity (covers CDN shared IPs, VPN, etc.)
-    const visitorHash = hasRealIp
-      ? ipHash                           // real IP (optionally salted by UA)
-      : hmacHash(`vid:${visitorCookie}`);// fallback to cookie id
+
+    const visitorId = getOrCreateVisitorId(req, res);
+    const visitorHash = makeVisitorHash({
+      mode: VISITOR_KEY_MODE,
+      vid: visitorId,
+      hasRealIp,
+      ip: ipInfo.ip,
+      ua: uaForHash
+    });
 
     const periodStart = getPeriodStart(now);
     const periodEndsAt = getPeriodEnd(now, PERIOD_MONTHS);
@@ -316,7 +320,6 @@ module.exports = async (req, res) => {
     // Keys
     const kvKeyActiveIp    = hasRealIp ? `ty:ip:${ipHash}` : null;
     const kvKeyEverIp      = hasRealIp ? `ty:ip:ever:${ipHash}` : null;
-
     const kvKeyGuestPeriod = `ty:guest:period:${PERIOD_MONTHS}m:${periodLabel}:${visitorHash}`;
     const kvKeyCustPeriod  = customerKeyHash ? `ty:cust:period:${PERIOD_MONTHS}m:${periodLabel}:${customerKeyHash}` : null;
     const kvKeyCustEver    = customerKeyHash ? `ty:cust:ever:${customerKeyHash}` : null;
@@ -324,6 +327,8 @@ module.exports = async (req, res) => {
     setDebugHeaders(res, {
       ipKind: ipInfo.kind,
       ipHash,
+      visitorHash,
+      visitorMode: VISITOR_KEY_MODE,
       guestMonthKey: kvKeyGuestPeriod,
       custMonthKey: kvKeyCustPeriod,
       activeIpKey: kvKeyActiveIp
@@ -368,7 +373,7 @@ module.exports = async (req, res) => {
       });
     }
 
-    // STRICT once: browser then IP/customer
+    // STRICT once (optional)
     if (STRICT_ONCE) {
       if (browserClaimed) return res.status(429).json({ error: 'already_claimed', reason: 'browser-cookie' });
       if (hasRealIp && kvKeyEverIp) {
@@ -381,7 +386,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // ----- ATOMIC monthly reservation (per visitor) -----
+    // Atomic monthly reservation (guest first, mirror for customer)
     const monthPayload = (marker) => ({
       code: null, marker,
       firstClaimAt: new Date(now).toISOString(),
@@ -405,7 +410,6 @@ module.exports = async (req, res) => {
       }
       reservedKeys.push(kvKeyCustPeriod);
 
-      // Mirror to guest key so browser swap on same visitor cannot bypass
       const ok2 = await kvSetNxEx(kvKeyGuestPeriod, monthPayload('mirror'), ttlSecPeriod);
       if (!ok2) {
         await kvDel(kvKeyCustPeriod);
@@ -420,7 +424,6 @@ module.exports = async (req, res) => {
       }
       reservedKeys.push(kvKeyGuestPeriod);
     } else {
-      // Guest monthly using per-visitor key
       const ok = await kvSetNxEx(kvKeyGuestPeriod, monthPayload('guest-reserve'), ttlSecPeriod);
       if (!ok) {
         const existing = await kvGet(kvKeyGuestPeriod);
@@ -435,7 +438,7 @@ module.exports = async (req, res) => {
       reservedKeys.push(kvKeyGuestPeriod);
     }
 
-    // ----- Active IP reuse/cooldown (48h) -----
+    // Active IP reuse window
     if (hasRealIp && kvKeyActiveIp) {
       const existing = await kvGet(kvKeyActiveIp);
       if (existing) {
@@ -463,7 +466,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // ----- Mint -----
+    // Mint
     let code = null, nodeId = null;
     for (let attempt = 1; attempt <= 5; attempt++) {
       const tryCode = genCode('TY');
@@ -486,7 +489,7 @@ module.exports = async (req, res) => {
       return res.status(502).json({ error: 'Failed to create discount code' });
     }
 
-    // ----- Persist monthly record(s) -----
+    // Persist monthly
     const monthlyRecord = {
       code, nodeId,
       firstClaimAt: new Date(now).toISOString(),
@@ -495,7 +498,7 @@ module.exports = async (req, res) => {
     await kvSet(kvKeyGuestPeriod, monthlyRecord);
     if (customerKeyHash && kvKeyCustPeriod) await kvSet(kvKeyCustPeriod, monthlyRecord);
 
-    // Race check (defensive)
+    // Race defense
     const checkGuest = await kvGet(kvKeyGuestPeriod);
     if (checkGuest && checkGuest.code && checkGuest.code !== code) {
       try { await deleteDiscountByNodeId(nodeId); } catch {}
@@ -507,7 +510,7 @@ module.exports = async (req, res) => {
       });
     }
 
-    // ----- Active IP lock (48h + cooldown) -----
+    // Active IP lock
     if (hasRealIp && kvKeyActiveIp) {
       const ttlSecActive =
         Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000)) +
@@ -517,7 +520,7 @@ module.exports = async (req, res) => {
       }, ttlSecActive);
     }
 
-    // Strict once-ever (optional)
+    // Optional "once ever"
     if (STRICT_ONCE && hasRealIp && kvKeyEverIp) {
       await kvSetExDays(kvKeyEverIp, { code, firstClaimAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId }, EVER_TTL_DAYS);
       if (customerKeyHash && kvKeyCustEver) {
@@ -525,7 +528,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // Browser dampening cookie
+    // Soft browser cookie
     const cookieMaxAge = STRICT_ONCE ? 10 * 365 * 24 * 3600 : Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000));
     setCookie(res, 'ty_claimed', '1', { maxAgeSec: cookieMaxAge });
 
