@@ -1,4 +1,7 @@
 {
   "name": "everlymadee",
   "version": "1.0.0"
+  "dependencies": {
+    "@upstash/redis": "latest"
 }
+
