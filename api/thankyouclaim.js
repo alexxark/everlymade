@@ -1,7 +1,7 @@
 // api/thankyouclaim.js — CommonJS (Vercel /api/*)
 // Enforcement order: IP first (hard), then browser (soft)
 //  - Active IP window (48h) + optional cooldown
-//  - Guest monthly limit by IP (calendar month)
+//  - Guest monthly limit by IP (calendar month, EXAT expiry)
 //  - Signed-in monthly limit by customer, mirrored to IP to block browser-swap
 //  - Cookie is a secondary damper, or "once ever" if STRICT_ONCE=true
 //
@@ -15,7 +15,8 @@
 //   REQUIRE_SIGNED_IN        (default false)
 //   STRICT_ONCE              (default false)
 //   EVER_TTL_DAYS            (default 0) // 0 = persist
-//   REQUIRE_REAL_IP_FOR_GUEST (default false) // if no real IP, tell guests to sign-in
+//   REQUIRE_REAL_IP_FOR_GUEST (default false)
+//   HASH_IP_WITH_UA          (default false) // reduces POP/CDN IP collisions
 
 const crypto = require('crypto');
 
@@ -37,6 +38,7 @@ const STRICT_ONCE   = String(process.env.STRICT_ONCE || 'false').toLowerCase() =
 const EVER_TTL_DAYS = parseFloat(process.env.EVER_TTL_DAYS || '0') || 0;
 
 const REQUIRE_REAL_IP_FOR_GUEST = String(process.env.REQUIRE_REAL_IP_FOR_GUEST || 'false').toLowerCase() === 'true';
+const HASH_IP_WITH_UA           = String(process.env.HASH_IP_WITH_UA || 'false').toLowerCase() === 'true';
 
 // ---------- Upstash helpers ----------
 async function kvGet(key) {
@@ -79,6 +81,24 @@ async function kvSetExDays(key, value, days) {
   if (days <= 0) return kvSet(key, value);
   const ttlSeconds = Math.floor(days * 86400);
   return kvSetEx(key, value, ttlSeconds);
+}
+
+// --- EXAT helpers for exact calendar expiry (Upstash supports EXAT) ---
+async function kvSetNxExAt(key, value, exatDate) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  const exatSec = Math.floor(exatDate.getTime() / 1000);
+  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EXAT=${exatSec}&NX=1`;
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
+  if (!r.ok) return false;
+  const data = await r.json().catch(() => null);
+  return data?.result === 'OK';
+}
+async function kvSetExAt(key, value, exatDate) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  const exatSec = Math.floor(exatDate.getTime() / 1000);
+  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EXAT=${exatSec}`;
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
+  return r.ok;
 }
 
 // ---------- Utils ----------
@@ -157,7 +177,6 @@ function addMonths(date, n) {
 }
 function getPeriodStart(now) { const d = new Date(now); d.setUTCDate(1); d.setUTCHours(0,0,0,0); return d; }
 function getPeriodEnd(now, months) { return addMonths(getPeriodStart(now), months); }
-function secondsUntil(fromMs, dateTo) { const ms = Math.max(0, dateTo.getTime() - fromMs); return Math.ceil(ms / 1000); }
 
 // ---------- Shopify helpers ----------
 async function shopifyGraphQL(query, variables) {
@@ -273,7 +292,11 @@ module.exports = async (req, res) => {
     // --- IP & period (IP-first) ---
     const ipInfo = getClientIpDetailed(req);         // { ip, kind }
     const hasRealIp = ipInfo.kind !== 'pseudo';
-    const ipHash = hasRealIp ? hmacHash(ipInfo.ip) : null;
+
+    const uaForHash = (req.headers['user-agent'] || '').toString().slice(0, 200);
+    const ipHash = hasRealIp
+      ? hmacHash(HASH_IP_WITH_UA ? `${ipInfo.ip}|${uaForHash}` : ipInfo.ip)
+      : null;
 
     const periodStart = getPeriodStart(now);
     const periodEndsAt = getPeriodEnd(now, PERIOD_MONTHS);
@@ -309,8 +332,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // --------- ATOMIC MONTHLY RESERVATION (IP-first) ---------
-    const ttlSecPeriod = secondsUntil(now, periodEndsAt);
+    // --------- ATOMIC MONTHLY RESERVATION (IP-first, EXAT at month end) ---------
     const monthPayload = (marker) => ({
       code: null, marker,
       firstClaimAt: new Date(now).toISOString(),
@@ -321,8 +343,8 @@ module.exports = async (req, res) => {
     let reservedKeys = [];
 
     if (customerKeyHash && kvKeyCustPeriod) {
-      // Customer monthly
-      const ok1 = await kvSetNxEx(kvKeyCustPeriod, monthPayload('cust-reserve'), ttlSecPeriod);
+      // Customer monthly (calendar EXAT)
+      const ok1 = await kvSetNxExAt(kvKeyCustPeriod, monthPayload('cust-reserve'), periodEndsAt);
       if (!ok1) {
         const existing = await kvGet(kvKeyCustPeriod);
         return res.status(429).json({
@@ -337,7 +359,7 @@ module.exports = async (req, res) => {
 
       // Mirror to IP so switching browsers on same network can’t mint as “guest”
       if (hasRealIp && kvKeyGuestPeriod) {
-        const ok2 = await kvSetNxEx(kvKeyGuestPeriod, monthPayload('mirror'), ttlSecPeriod);
+        const ok2 = await kvSetNxExAt(kvKeyGuestPeriod, monthPayload('mirror'), periodEndsAt);
         if (!ok2) {
           await kvDel(kvKeyCustPeriod); // release
           const existing = await kvGet(kvKeyGuestPeriod);
@@ -354,7 +376,7 @@ module.exports = async (req, res) => {
     } else {
       // Guest monthly — only if we truly have a real public IP
       if (hasRealIp && kvKeyGuestPeriod) {
-        const ok = await kvSetNxEx(kvKeyGuestPeriod, monthPayload('guest-reserve'), ttlSecPeriod);
+        const ok = await kvSetNxExAt(kvKeyGuestPeriod, monthPayload('guest-reserve'), periodEndsAt);
         if (!ok) {
           const existing = await kvGet(kvKeyGuestPeriod);
           return res.status(429).json({
@@ -427,16 +449,18 @@ module.exports = async (req, res) => {
       return res.status(502).json({ error: 'Failed to create discount code' });
     }
 
-    // --------- Persist monthly record(s) + conflict cross-check ---------
+    // --------- Persist monthly record(s) (calendar EXAT) + conflict cross-check ---------
     const monthlyRecord = {
       code, nodeId,
       firstClaimAt: new Date(now).toISOString(),
       periodEndsAt: periodEndsAt.toISOString()
     };
 
-    if (hasRealIp && kvKeyGuestPeriod) await kvSet(kvKeyGuestPeriod, monthlyRecord);
-    if (customerKeyHash && kvKeyCustPeriod) await kvSet(kvKeyCustPeriod, monthlyRecord);
+    // Overwrite the placeholder "reserve" records with the real code & EXAT
+    if (hasRealIp && kvKeyGuestPeriod) await kvSetExAt(kvKeyGuestPeriod, monthlyRecord, periodEndsAt);
+    if (customerKeyHash && kvKeyCustPeriod) await kvSetExAt(kvKeyCustPeriod, monthlyRecord, periodEndsAt);
 
+    // Double-check: if a different code is already stored for this month (race), revoke new mint
     if (hasRealIp && kvKeyGuestPeriod) {
       const checkGuest = await kvGet(kvKeyGuestPeriod);
       if (checkGuest && checkGuest.code && checkGuest.code !== code) {
@@ -453,7 +477,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // --------- Active IP lock (48h + cooldown) ---------
+    // --------- Active IP lock (48h + cooldown via EX) ---------
     if (hasRealIp && kvKeyActiveIp) {
       const ttlSecActive =
         Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000)) +
