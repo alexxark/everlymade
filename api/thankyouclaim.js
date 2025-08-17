@@ -1,4 +1,4 @@
-// api/thankyouclaim.js — CommonJS (Vercel /api/*)
+// api/thankyouclaim.js — CommonJS (Vercel /api/*) WITH DEBUG
 // Enforcement order: IP first (hard), then browser (soft)
 //  - Active IP window (48h) + optional cooldown
 //  - Guest monthly limit by IP (calendar month, EXAT expiry)
@@ -42,14 +42,14 @@ const HASH_IP_WITH_UA           = String(process.env.HASH_IP_WITH_UA || 'false')
 
 // ---------- Upstash helpers ----------
 async function kvGet(key) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN || !key) return null;
   const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
     cache: 'no-store',
   });
   if (!r.ok) return null;
   const data = await r.json().catch(() => null);
-  return data?.result ? JSON.parse(data.result) : null;
+  try { return data?.result ? JSON.parse(data.result) : null; } catch { return data?.result ?? null; }
 }
 async function kvSetEx(key, value, ttlSeconds) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
@@ -66,7 +66,7 @@ async function kvSetNxEx(key, value, ttlSeconds) {
   return data?.result === 'OK';
 }
 async function kvDel(key) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN || !key) return false;
   const url = `${UPSTASH_URL}/del/${encodeURIComponent(key)}`;
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
   return r.ok;
@@ -82,7 +82,6 @@ async function kvSetExDays(key, value, days) {
   const ttlSeconds = Math.floor(days * 86400);
   return kvSetEx(key, value, ttlSeconds);
 }
-
 // --- EXAT helpers for exact calendar expiry (Upstash supports EXAT) ---
 async function kvSetNxExAt(key, value, exatDate) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
@@ -103,45 +102,35 @@ async function kvSetExAt(key, value, exatDate) {
 
 // ---------- Utils ----------
 function genCode(prefix = 'TY') {
-  let slug = Math.random().toString(36).slice(2, 6).toUpperCase();
-  while (slug.length < 4) slug += '0';
-  slug = slug.slice(0, 4);
-  return `${prefix}-${slug}`;
+  const pool = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
+  let four = '';
+  for (let i = 0; i < 4; i++) four += pool[Math.floor(Math.random() * pool.length)];
+  return `${prefix}-${four}`;
 }
-
 function isPrivateIp(ip) {
   return /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[0-1])\.|^127\.|^::1$|^fc00:|^fe80:/.test(ip);
 }
-
-// Robust client IP resolver — returns { ip, kind }, never a global constant
 function getClientIpDetailed(req) {
   const pick = v => (typeof v === 'string' && v.trim()) ? v.trim() : '';
-
   const cf  = pick(req.headers['cf-connecting-ip']);        if (cf)  return { ip: cf, kind: 'cf'  };
   const tci = pick(req.headers['true-client-ip']);          if (tci) return { ip: tci, kind: 'tci' };
-  const vff = pick(req.headers['x-vercel-forwarded-for']);  if (vff) {
-    const ip = vff.split(',')[0].trim().replace(/^::ffff:/, '');
-    if (ip) return { ip, kind: 'vff' };
-  }
-  const xff = pick(req.headers['x-forwarded-for']);         if (xff) {
+  const vff = pick(req.headers['x-vercel-forwarded-for']);  if (vff) return { ip: vff.split(',')[0].trim().replace(/^::ffff:/, ''), kind: 'vff' };
+  const xff = pick(req.headers['x-forwarded-for']);
+  if (xff) {
     const parts = xff.split(',').map(s => s.trim()).filter(Boolean).map(s => s.replace(/^::ffff:/, ''));
     for (const ip of parts) { if (!isPrivateIp(ip)) return { ip, kind: 'xff' }; }
     if (parts.length) return { ip: parts[0], kind: 'xff' };
   }
   const xr = pick(req.headers['x-real-ip']);                if (xr)  return { ip: xr.replace(/^::ffff:/, ''), kind: 'xr' };
   const sock = pick(req.socket?.remoteAddress);             if (sock) return { ip: sock.replace(/^::ffff:/, ''), kind: 'sock' };
-
-  // LAST RESORT: per-request pseudo (not universal)
   const ua = pick(req.headers['user-agent']);
   const al = pick(req.headers['accept-language']);
   const pseudo = crypto.createHash('sha1').update(ua + '|' + al).digest('hex').slice(0, 12);
   return { ip: `pseudo:${pseudo}`, kind: 'pseudo' };
 }
-
 function hmacHash(input, salt = IP_HASH_SALT) {
   return crypto.createHmac('sha256', salt).update(String(input)).digest('hex');
 }
-
 function parseCookies(req) {
   const h = req.headers.cookie || '';
   return h.split(';').reduce((acc, part) => {
@@ -151,14 +140,12 @@ function parseCookies(req) {
     return acc;
   }, {});
 }
-
 function appendHeader(res, name, value) {
   const prev = res.getHeader(name);
   if (!prev) return res.setHeader(name, value);
   if (Array.isArray(prev)) return res.setHeader(name, prev.concat(value));
   return res.setHeader(name, [prev, value]);
 }
-
 function setCookie(res, name, value, { maxAgeSec, path='/', httpOnly=true, sameSite='Lax', secure=true } = {}) {
   const parts = [`${name}=${encodeURIComponent(value)}`, `Path=${path}`, `SameSite=${sameSite}`];
   if (httpOnly) parts.push('HttpOnly');
@@ -166,7 +153,6 @@ function setCookie(res, name, value, { maxAgeSec, path='/', httpOnly=true, sameS
   if (Number.isFinite(maxAgeSec)) parts.push(`Max-Age=${Math.max(0, Math.floor(maxAgeSec))}`);
   appendHeader(res, 'Set-Cookie', parts.join('; '));
 }
-
 // Calendar month helpers
 function addMonths(date, n) {
   const d = new Date(date);
@@ -182,16 +168,12 @@ function getPeriodEnd(now, months) { return addMonths(getPeriodStart(now), month
 async function shopifyGraphQL(query, variables) {
   const r = await fetch(`https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`, {
     method: 'POST',
-    headers: {
-      'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
-      'Content-Type': 'application/json',
-    },
+    headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables })
   });
   const data = await r.json().catch(() => ({}));
   return { ok: r.ok, data, status: r.status };
 }
-
 async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
   const mutation = `
     mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
@@ -199,8 +181,7 @@ async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
         codeDiscountNode { id }
         userErrors { field message }
       }
-    }
-  `;
+    }`;
   const variables = {
     basicCodeDiscount: {
       title: code,
@@ -226,7 +207,6 @@ async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
   if (!node) throw new Error('No codeDiscountNode returned');
   return node.id;
 }
-
 async function deleteDiscountByNodeId(nodeId) {
   const mutation = `
     mutation discountCodeDelete($id: ID!) {
@@ -234,13 +214,29 @@ async function deleteDiscountByNodeId(nodeId) {
         deletedCodeDiscountId
         userErrors { field message }
       }
-    }
-  `;
+    }`;
   const { ok, data, status } = await shopifyGraphQL(mutation, { id: nodeId });
   if (!ok) throw new Error(`Shopify HTTP ${status}`);
   const errs = data?.data?.discountCodeDelete?.userErrors;
   if (errs?.length) throw new Error(`Delete validation: ${JSON.stringify(errs)}`);
   return true;
+}
+
+// ---------- Debug helpers ----------
+function setDebugHeaders(res, obj = {}) {
+  for (const [k, v] of Object.entries(obj)) {
+    if (v == null) continue;
+    res.setHeader(`X-TY-${k}`, typeof v === 'string' ? v : JSON.stringify(v));
+  }
+}
+function getDebugFlag(req, body) {
+  try {
+    const url = req.url ? new URL(req.url, 'http://localhost') : null;
+    const q = url ? url.searchParams.get('debug') : null;
+    const inQuery = q === '1' || q === 'true';
+    const inBody  = body && (body.debug === 1 || body.debug === true || body.debug === '1' || body.debug === 'true');
+    return Boolean(inQuery || inBody);
+  } catch { return false; }
 }
 
 // ---------- Handler ----------
@@ -260,6 +256,8 @@ module.exports = async (req, res) => {
 
     // Parse request
     const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+    const DEBUG = getDebugFlag(req, body);
+
     const clientExpiresAtIso = body?.expiresAt;
     const customerIdRaw      = body?.customerId || null;
     const customerEmailRaw   = body?.customerEmail || null;
@@ -268,10 +266,11 @@ module.exports = async (req, res) => {
     const browserClaimed = cookies['ty_claimed'] === '1';
 
     if (REQUIRE_SIGNED_IN && !customerIdRaw && !customerEmailRaw) {
-      return res.status(401).json({ error: 'signin_required', message: 'Please sign in to claim this offer.' });
+      setDebugHeaders(res, { reason: 'signin_required' });
+      return res.status(401).json({ error: 'signin_required', reason: 'signin_required' });
     }
 
-    // Normalize customer identity (optional, only if provided)
+    // Normalize customer identity (optional)
     let customerKeyHash = null;
     if (customerIdRaw) customerKeyHash = hmacHash(`id:${String(customerIdRaw).trim()}`);
     else if (customerEmailRaw) customerKeyHash = hmacHash(`email:${String(customerEmailRaw).trim().toLowerCase()}`);
@@ -292,7 +291,6 @@ module.exports = async (req, res) => {
     // --- IP & period (IP-first) ---
     const ipInfo = getClientIpDetailed(req);         // { ip, kind }
     const hasRealIp = ipInfo.kind !== 'pseudo';
-
     const uaForHash = (req.headers['user-agent'] || '').toString().slice(0, 200);
     const ipHash = hasRealIp
       ? hmacHash(HASH_IP_WITH_UA ? `${ipInfo.ip}|${uaForHash}` : ipInfo.ip)
@@ -304,35 +302,77 @@ module.exports = async (req, res) => {
     const cm = String(periodStart.getUTCMonth() + 1).padStart(2, '0');
     const periodLabel = `${cy}${cm}`;
 
-    // Keys — ALWAYS include the hashed IP when we have it
+    // Keys
     const kvKeyActiveIp    = hasRealIp ? `ty:ip:${ipHash}` : null;
     const kvKeyEverIp      = hasRealIp ? `ty:ip:ever:${ipHash}` : null;
     const kvKeyGuestPeriod = hasRealIp ? `ty:guest:period:${PERIOD_MONTHS}m:${periodLabel}:${ipHash}` : null;
-
     const kvKeyCustPeriod  = customerKeyHash ? `ty:cust:period:${PERIOD_MONTHS}m:${periodLabel}:${customerKeyHash}` : null;
     const kvKeyCustEver    = customerKeyHash ? `ty:cust:ever:${customerKeyHash}` : null;
 
-    // If we can't see a real IP and you want to force sign-in for guests, do it.
+    setDebugHeaders(res, {
+      ipKind: ipInfo.kind,
+      ipHash,
+      hashWithUA: String(HASH_IP_WITH_UA),
+      periodLabel,
+      guestMonthKey: kvKeyGuestPeriod,
+      custMonthKey: kvKeyCustPeriod,
+      activeIpKey: kvKeyActiveIp
+    });
+
+    // If no real IP and guest not allowed
     if (!hasRealIp && !customerKeyHash && REQUIRE_REAL_IP_FOR_GUEST) {
-      return res.status(401).json({ error: 'signin_required', message: 'Please sign in to claim this offer.' });
+      setDebugHeaders(res, { reason: 'no-real-ip-and-guest' });
+      return res.status(401).json({ error: 'signin_required', reason: 'no-real-ip-and-guest' });
     }
 
-    // STRICT once: browser (soft), then IP/customer (hard)
+    // ---------- DEBUG PATH (no writes) ----------
+    if (DEBUG) {
+      const existingGuest = kvKeyGuestPeriod ? await kvGet(kvKeyGuestPeriod) : null;
+      const existingCust  = kvKeyCustPeriod  ? await kvGet(kvKeyCustPeriod)  : null;
+      const existingAct   = kvKeyActiveIp    ? await kvGet(kvKeyActiveIp)    : null;
+      const existingEverI = kvKeyEverIp      ? await kvGet(kvKeyEverIp)      : null;
+      const existingEverC = kvKeyCustEver    ? await kvGet(kvKeyCustEver)    : null;
+
+      const wouldBlock =
+        (STRICT_ONCE && (browserClaimed || existingEverI || existingEverC)) ||
+        (!!existingCust) ||
+        (!!existingGuest) ||
+        (existingAct && Date.parse(existingAct.endsAt) > now);
+
+      const reason =
+        STRICT_ONCE && browserClaimed ? 'browser-cookie' :
+        STRICT_ONCE && existingEverI ? 'ip-ever-lock' :
+        STRICT_ONCE && existingEverC ? 'customer-ever-lock' :
+        existingCust ? 'monthly-lock-customer' :
+        existingGuest ? 'monthly-lock-guest' :
+        (existingAct && Date.parse(existingAct.endsAt) > now) ? 'active-ip-reuse' :
+        'would-mint';
+
+      setDebugHeaders(res, { debug: '1', wouldBlock: String(wouldBlock), reason });
+      return res.status(200).json({
+        ok: !wouldBlock,
+        debug: true,
+        reason,
+        keys: { kvKeyGuestPeriod, kvKeyCustPeriod, kvKeyActiveIp, kvKeyEverIp, kvKeyCustEver },
+        existing: { guestMonthly: existingGuest, customerMonthly: existingCust, activeIp: existingAct, everIp: existingEverI, everCustomer: existingEverC },
+        note: 'No writes performed in debug mode.'
+      });
+    }
+
+    // STRICT once: browser then IP/customer
     if (STRICT_ONCE) {
-      if (browserClaimed) {
-        return res.status(429).json({ error: 'already_claimed', message: 'This offer was already claimed from this browser.' });
-      }
+      if (browserClaimed) return res.status(429).json({ error: 'already_claimed', reason: 'browser-cookie' });
       if (hasRealIp) {
         const everIp = await kvGet(kvKeyEverIp);
-        if (everIp) return res.status(429).json({ error: 'already_claimed', message: 'This offer was already claimed from your network.' });
+        if (everIp) return res.status(429).json({ error: 'already_claimed', reason: 'ip-ever-lock' });
       }
       if (customerKeyHash) {
         const everCust = await kvGet(kvKeyCustEver);
-        if (everCust) return res.status(429).json({ error: 'already_claimed_customer', message: 'This offer was already claimed on this customer account.' });
+        if (everCust) return res.status(429).json({ error: 'already_claimed_customer', reason: 'customer-ever-lock' });
       }
     }
 
-    // --------- ATOMIC MONTHLY RESERVATION (IP-first, EXAT at month end) ---------
+    // --------- ATOMIC MONTHLY RESERVATION (calendar EXAT) ---------
     const monthPayload = (marker) => ({
       code: null, marker,
       firstClaimAt: new Date(now).toISOString(),
@@ -343,13 +383,12 @@ module.exports = async (req, res) => {
     let reservedKeys = [];
 
     if (customerKeyHash && kvKeyCustPeriod) {
-      // Customer monthly (calendar EXAT)
       const ok1 = await kvSetNxExAt(kvKeyCustPeriod, monthPayload('cust-reserve'), periodEndsAt);
       if (!ok1) {
         const existing = await kvGet(kvKeyCustPeriod);
         return res.status(429).json({
           error: 'already_claimed_monthly',
-          message: 'You have already claimed this offer for the current period.',
+          reason: 'monthly-lock-customer',
           periodEndsAt: periodEndsAt.toISOString(),
           code: existing?.code || undefined,
           reused: true
@@ -357,15 +396,14 @@ module.exports = async (req, res) => {
       }
       reservedKeys.push(kvKeyCustPeriod);
 
-      // Mirror to IP so switching browsers on same network can’t mint as “guest”
       if (hasRealIp && kvKeyGuestPeriod) {
         const ok2 = await kvSetNxExAt(kvKeyGuestPeriod, monthPayload('mirror'), periodEndsAt);
         if (!ok2) {
-          await kvDel(kvKeyCustPeriod); // release
+          await kvDel(kvKeyCustPeriod);
           const existing = await kvGet(kvKeyGuestPeriod);
           return res.status(429).json({
             error: 'already_claimed_monthly',
-            message: 'You have already claimed this offer for the current period.',
+            reason: 'monthly-lock-guest',
             periodEndsAt: periodEndsAt.toISOString(),
             code: existing?.code || undefined,
             reused: true
@@ -374,14 +412,13 @@ module.exports = async (req, res) => {
         reservedKeys.push(kvKeyGuestPeriod);
       }
     } else {
-      // Guest monthly — only if we truly have a real public IP
       if (hasRealIp && kvKeyGuestPeriod) {
         const ok = await kvSetNxExAt(kvKeyGuestPeriod, monthPayload('guest-reserve'), periodEndsAt);
         if (!ok) {
           const existing = await kvGet(kvKeyGuestPeriod);
           return res.status(429).json({
             error: 'already_claimed_monthly',
-            message: 'You have already claimed this offer for the current period.',
+            reason: 'monthly-lock-guest',
             periodEndsAt: periodEndsAt.toISOString(),
             code: existing?.code || undefined,
             reused: true
@@ -389,7 +426,6 @@ module.exports = async (req, res) => {
         }
         reservedKeys.push(kvKeyGuestPeriod);
       }
-      // If no real IP, skip guest monthly reservation to avoid globally blocking everyone.
     }
 
     // --------- Active IP reuse/cooldown (48h) ---------
@@ -399,12 +435,9 @@ module.exports = async (req, res) => {
         const existingEnd = Date.parse(existing.endsAt);
         if (existingEnd > now) {
           return res.status(200).json({
-            ok: true, reused: true,
-            code: existing.code,
-            startsAt: existing.startsAt,
-            endsAt: existing.endsAt,
-            nodeId: existing.nodeId || null,
-            ipKind: ipInfo.kind
+            ok: true, reused: true, reason: 'active-ip-reuse',
+            code: existing.code, startsAt: existing.startsAt, endsAt: existing.endsAt,
+            nodeId: existing.nodeId || null, ipKind: ipInfo.kind
           });
         }
         if (TY_COOLDOWN_HOURS > 0) {
@@ -412,9 +445,9 @@ module.exports = async (req, res) => {
           if (cooldownUntil > now) {
             return res.status(429).json({
               error: 'rate_limited',
-              message: 'This offer was already claimed from your network. Try again later.',
-              code: existing.code,
-              endsAt: existing.endsAt,
+              reason: 'cooldown-active',
+              message: 'Already claimed from your network. Try again later.',
+              code: existing.code, endsAt: existing.endsAt,
               cooldownUntil: new Date(cooldownUntil).toISOString(),
               ipKind: ipInfo.kind
             });
@@ -423,9 +456,8 @@ module.exports = async (req, res) => {
       }
     }
 
-    // --------- Mint (we hold any reservations) ---------
-    let code = null;
-    let nodeId = null;
+    // --------- Mint ---------
+    let code = null, nodeId = null;
     for (let attempt = 1; attempt <= 5; attempt++) {
       const tryCode = genCode('TY');
       try {
@@ -435,9 +467,7 @@ module.exports = async (req, res) => {
           endsAt:   chosenEndsAt.toISOString(),
           percent:  TY_PERCENT
         });
-        code = tryCode;
-        nodeId = id;
-        break;
+        code = tryCode; nodeId = id; break;
       } catch (err) {
         if (String(err?.message || '').includes('Code collision')) continue;
         for (const k of reservedKeys) await kvDel(k);
@@ -449,30 +479,25 @@ module.exports = async (req, res) => {
       return res.status(502).json({ error: 'Failed to create discount code' });
     }
 
-    // --------- Persist monthly record(s) (calendar EXAT) + conflict cross-check ---------
+    // --------- Persist monthly record(s) with EXAT ---------
     const monthlyRecord = {
       code, nodeId,
       firstClaimAt: new Date(now).toISOString(),
       periodEndsAt: periodEndsAt.toISOString()
     };
-
-    // Overwrite the placeholder "reserve" records with the real code & EXAT
     if (hasRealIp && kvKeyGuestPeriod) await kvSetExAt(kvKeyGuestPeriod, monthlyRecord, periodEndsAt);
     if (customerKeyHash && kvKeyCustPeriod) await kvSetExAt(kvKeyCustPeriod, monthlyRecord, periodEndsAt);
 
-    // Double-check: if a different code is already stored for this month (race), revoke new mint
+    // Race check: if stored code differs, revoke new mint
     if (hasRealIp && kvKeyGuestPeriod) {
       const checkGuest = await kvGet(kvKeyGuestPeriod);
       if (checkGuest && checkGuest.code && checkGuest.code !== code) {
-        try { await deleteDiscountByNodeId(nodeId); } catch (_) {}
+        try { await deleteDiscountByNodeId(nodeId); } catch {}
         return res.status(429).json({
           error: 'already_claimed_monthly',
-          message: 'You have already claimed this offer for the current period.',
+          reason: 'monthly-lock-race',
           periodEndsAt: periodEndsAt.toISOString(),
-          code: checkGuest.code,
-          revokedNewMint: true,
-          reused: true,
-          ipKind: ipInfo.kind
+          code: checkGuest.code, revokedNewMint: true, reused: true, ipKind: ipInfo.kind
         });
       }
     }
@@ -482,12 +507,8 @@ module.exports = async (req, res) => {
       const ttlSecActive =
         Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000)) +
         Math.max(0, Math.floor(TY_COOLDOWN_HOURS * 3600));
-
       await kvSetEx(kvKeyActiveIp, {
-        code,
-        startsAt: startsAt.toISOString(),
-        endsAt:   chosenEndsAt.toISOString(),
-        nodeId
+        code, startsAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId
       }, ttlSecActive);
     }
 
@@ -503,19 +524,27 @@ module.exports = async (req, res) => {
     const cookieMaxAge = STRICT_ONCE ? 10 * 365 * 24 * 3600 : Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000));
     setCookie(res, 'ty_claimed', '1', { maxAgeSec: cookieMaxAge });
 
+    setDebugHeaders(res, {
+      reason: 'minted',
+      code, nodeId,
+      endsAt: chosenEndsAt.toISOString(),
+      ipKind: ipInfo.kind
+    });
+
     return res.status(200).json({
-      ok: true,
+      ok: true, reason: 'minted',
       code,
       startsAt: startsAt.toISOString(),
       endsAt:   chosenEndsAt.toISOString(),
       nodeId,
       customerLimitedByMonths: customerKeyHash ? PERIOD_MONTHS : undefined,
       guestLimitedByMonths: (!customerKeyHash && hasRealIp) ? PERIOD_MONTHS : undefined,
-      ipKind: ipInfo.kind // helpful for debugging; remove later if you’d like
+      ipKind: ipInfo.kind
     });
 
   } catch (e) {
     console.error('Unhandled error creating discount', e);
+    setDebugHeaders(res, { reason: 'server-error', error: String(e?.message || e) });
     return res.status(500).json({ error: 'Unhandled error', message: e?.message || String(e) });
   }
 };
