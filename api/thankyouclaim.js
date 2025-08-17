@@ -1,4 +1,4 @@
-// api/thankyouclaim.js — CommonJS (Vercel /api/*) WITH DEBUG
+// api/thankyouclaim.js — CommonJS (Vercel /api/*) WITH DEBUG & SAFE EXAT WRITES
 // Enforcement order: IP first (hard), then browser (soft)
 //  - Active IP window (48h) + optional cooldown
 //  - Guest monthly limit by IP (calendar month, EXAT expiry)
@@ -52,16 +52,27 @@ async function kvGet(key) {
   try { return data?.result ? JSON.parse(data.result) : null; } catch { return data?.result ?? null; }
 }
 async function kvSetEx(key, value, ttlSeconds) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) throw new Error('UPSTASH env missing');
   const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${encodeURIComponent(ttlSeconds)}`;
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
-  return r.ok;
+  if (!r.ok) {
+    const text = await r.text().catch(()=> '');
+    const err = new Error(`Upstash SET EX failed: HTTP ${r.status} ${text.slice(0,200)}`);
+    err.status = r.status;
+    throw err;
+  }
+  return true;
 }
 async function kvSetNxEx(key, value, ttlSeconds) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) throw new Error('UPSTASH env missing');
   const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${encodeURIComponent(ttlSeconds)}&NX=1`;
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
-  if (!r.ok) return false;
+  if (!r.ok) {
+    const text = await r.text().catch(()=> '');
+    const err = new Error(`Upstash SET EX NX failed: HTTP ${r.status} ${text.slice(0,200)}`);
+    err.status = r.status;
+    throw err;
+  }
   const data = await r.json().catch(() => null);
   return data?.result === 'OK';
 }
@@ -72,32 +83,51 @@ async function kvDel(key) {
   return r.ok;
 }
 async function kvSet(key, value) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) throw new Error('UPSTASH env missing');
   const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}`;
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
-  return r.ok;
+  if (!r.ok) {
+    const text = await r.text().catch(()=> '');
+    const err = new Error(`Upstash SET failed: HTTP ${r.status} ${text.slice(0,200)}`);
+    err.status = r.status;
+    throw err;
+  }
+  return true;
 }
 async function kvSetExDays(key, value, days) {
   if (days <= 0) return kvSet(key, value);
   const ttlSeconds = Math.floor(days * 86400);
   return kvSetEx(key, value, ttlSeconds);
 }
-// --- EXAT helpers for exact calendar expiry (Upstash supports EXAT) ---
+
+// --- EXAT helpers for exact calendar expiry (THROW on HTTP error) ---
 async function kvSetNxExAt(key, value, exatDate) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) throw new Error('UPSTASH env missing');
   const exatSec = Math.floor(exatDate.getTime() / 1000);
   const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EXAT=${exatSec}&NX=1`;
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
-  if (!r.ok) return false;
-  const data = await r.json().catch(() => null);
+  if (!r.ok) {
+    const text = await r.text().catch(()=> '');
+    const err = new Error(`Upstash SET EXAT NX failed: HTTP ${r.status} ${text.slice(0,200)}`);
+    err.status = r.status;
+    throw err;
+  }
+  const data = await r.json().catch(() => ({}));
+  // true if set, false if already existed
   return data?.result === 'OK';
 }
 async function kvSetExAt(key, value, exatDate) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) throw new Error('UPSTASH env missing');
   const exatSec = Math.floor(exatDate.getTime() / 1000);
   const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EXAT=${exatSec}`;
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
-  return r.ok;
+  if (!r.ok) {
+    const text = await r.text().catch(()=> '');
+    const err = new Error(`Upstash SET EXAT failed: HTTP ${r.status} ${text.slice(0,200)}`);
+    err.status = r.status;
+    throw err;
+  }
+  return true;
 }
 
 // ---------- Utils ----------
@@ -266,7 +296,7 @@ module.exports = async (req, res) => {
     const browserClaimed = cookies['ty_claimed'] === '1';
 
     if (REQUIRE_SIGNED_IN && !customerIdRaw && !customerEmailRaw) {
-      setDebugHeaders(res, { reason: 'signin_required' });
+      setDebugHeaders(res, { reason: 'signin_required', upstashUrlHash: (UPSTASH_URL||'').slice(0,40) });
       return res.status(401).json({ error: 'signin_required', reason: 'signin_required' });
     }
 
@@ -316,7 +346,8 @@ module.exports = async (req, res) => {
       periodLabel,
       guestMonthKey: kvKeyGuestPeriod,
       custMonthKey: kvKeyCustPeriod,
-      activeIpKey: kvKeyActiveIp
+      activeIpKey: kvKeyActiveIp,
+      upstashUrlHash: (UPSTASH_URL||'').slice(0,40)
     });
 
     // If no real IP and guest not allowed
@@ -383,7 +414,13 @@ module.exports = async (req, res) => {
     let reservedKeys = [];
 
     if (customerKeyHash && kvKeyCustPeriod) {
-      const ok1 = await kvSetNxExAt(kvKeyCustPeriod, monthPayload('cust-reserve'), periodEndsAt);
+      let ok1;
+      try {
+        ok1 = await kvSetNxExAt(kvKeyCustPeriod, monthPayload('cust-reserve'), periodEndsAt);
+      } catch (e) {
+        console.error('kvSetNxExAt(cust) failed', e);
+        return res.status(502).json({ error: 'kv-write-failed', where: 'customer-monthly', message: String(e.message || e) });
+      }
       if (!ok1) {
         const existing = await kvGet(kvKeyCustPeriod);
         return res.status(429).json({
@@ -397,7 +434,14 @@ module.exports = async (req, res) => {
       reservedKeys.push(kvKeyCustPeriod);
 
       if (hasRealIp && kvKeyGuestPeriod) {
-        const ok2 = await kvSetNxExAt(kvKeyGuestPeriod, monthPayload('mirror'), periodEndsAt);
+        let ok2;
+        try {
+          ok2 = await kvSetNxExAt(kvKeyGuestPeriod, monthPayload('mirror'), periodEndsAt);
+        } catch (e) {
+          console.error('kvSetNxExAt(mirror) failed', e);
+          await kvDel(kvKeyCustPeriod);
+          return res.status(502).json({ error: 'kv-write-failed', where: 'mirror-guest', message: String(e.message || e) });
+        }
         if (!ok2) {
           await kvDel(kvKeyCustPeriod);
           const existing = await kvGet(kvKeyGuestPeriod);
@@ -413,7 +457,13 @@ module.exports = async (req, res) => {
       }
     } else {
       if (hasRealIp && kvKeyGuestPeriod) {
-        const ok = await kvSetNxExAt(kvKeyGuestPeriod, monthPayload('guest-reserve'), periodEndsAt);
+        let ok;
+        try {
+          ok = await kvSetNxExAt(kvKeyGuestPeriod, monthPayload('guest-reserve'), periodEndsAt);
+        } catch (e) {
+          console.error('kvSetNxExAt(guest) failed', e);
+          return res.status(502).json({ error: 'kv-write-failed', where: 'guest-monthly', message: String(e.message || e) });
+        }
         if (!ok) {
           const existing = await kvGet(kvKeyGuestPeriod);
           return res.status(429).json({
@@ -485,8 +535,15 @@ module.exports = async (req, res) => {
       firstClaimAt: new Date(now).toISOString(),
       periodEndsAt: periodEndsAt.toISOString()
     };
-    if (hasRealIp && kvKeyGuestPeriod) await kvSetExAt(kvKeyGuestPeriod, monthlyRecord, periodEndsAt);
-    if (customerKeyHash && kvKeyCustPeriod) await kvSetExAt(kvKeyCustPeriod, monthlyRecord, periodEndsAt);
+    try {
+      if (hasRealIp && kvKeyGuestPeriod) await kvSetExAt(kvKeyGuestPeriod, monthlyRecord, periodEndsAt);
+      if (customerKeyHash && kvKeyCustPeriod) await kvSetExAt(kvKeyCustPeriod, monthlyRecord, periodEndsAt);
+    } catch (e) {
+      console.error('kvSetExAt(finalize) failed', e);
+      // Try to revoke newly minted code to avoid orphaning
+      try { await deleteDiscountByNodeId(nodeId); } catch {}
+      return res.status(502).json({ error: 'kv-write-failed', where: 'finalize-monthly', message: String(e.message || e) });
+    }
 
     // Race check: if stored code differs, revoke new mint
     if (hasRealIp && kvKeyGuestPeriod) {
@@ -507,16 +564,27 @@ module.exports = async (req, res) => {
       const ttlSecActive =
         Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000)) +
         Math.max(0, Math.floor(TY_COOLDOWN_HOURS * 3600));
-      await kvSetEx(kvKeyActiveIp, {
-        code, startsAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId
-      }, ttlSecActive);
+      try {
+        await kvSetEx(kvKeyActiveIp, {
+          code, startsAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId
+        }, ttlSecActive);
+      } catch (e) {
+        console.error('kvSetEx(active) failed', e);
+        // Non-fatal: return success but surface a warning
+        setDebugHeaders(res, { warn: 'active-ip-write-failed', err: String(e?.message || e) });
+      }
     }
 
     // Strict once-ever (optional)
     if (STRICT_ONCE && hasRealIp && kvKeyEverIp) {
-      await kvSetExDays(kvKeyEverIp, { code, firstClaimAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId }, EVER_TTL_DAYS);
-      if (customerKeyHash && kvKeyCustEver) {
-        await kvSetExDays(kvKeyCustEver, { code, firstClaimAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId }, EVER_TTL_DAYS);
+      try {
+        await kvSetExDays(kvKeyEverIp, { code, firstClaimAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId }, EVER_TTL_DAYS);
+        if (customerKeyHash && kvKeyCustEver) {
+          await kvSetExDays(kvKeyCustEver, { code, firstClaimAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId }, EVER_TTL_DAYS);
+        }
+      } catch (e) {
+        console.error('kvSetExDays(ever) failed', e);
+        setDebugHeaders(res, { warn: 'ever-write-failed', err: String(e?.message || e) });
       }
     }
 
@@ -544,7 +612,7 @@ module.exports = async (req, res) => {
 
   } catch (e) {
     console.error('Unhandled error creating discount', e);
-    setDebugHeaders(res, { reason: 'server-error', error: String(e?.message || e) });
+    setDebugHeaders(res, { reason: 'server-error', error: String(e?.message || e), upstashUrlHash: (UPSTASH_URL||'').slice(0,40) });
     return res.status(500).json({ error: 'Unhandled error', message: e?.message || String(e) });
   }
 };
