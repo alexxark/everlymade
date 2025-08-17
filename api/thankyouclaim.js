@@ -1,20 +1,21 @@
 // api/thankyouclaim.js — CommonJS (Vercel /api/*)
-// Layers of protection:
+// Protections:
 // 1) Browser cookie lock (same browser)
 // 2) IP active lock + optional cooldown (same network)
-// 3) Per-customer monthly limit (if signed-in)
-// 4) Per-guest monthly limit (if NOT signed-in) — NEW
-// 5) Optional "ever" strict-once across IP/browser/customer
+// 3) Per-customer monthly limit (if signed-in) — ATOMIC (NX)
+// 4) Per-guest monthly limit (if NOT signed-in) — ATOMIC (NX)
+// 5) Signed-in mints also mirror a guest/IP monthly key (closes browser-swap loophole)
+// 6) Optional "ever" strict-once across IP/browser/customer
+// 7) Cross-check + rollback: if a conflicting monthly record is found after mint, delete the new code and return monthly error.
 //
-// ENV VARS to set (most you already have):
+// ENV VARS:
 //   SHOPIFY_SHOP, SHOPIFY_ADMIN_TOKEN
 //   UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
-//   IP_HASH_SALT (long random string)
+//   IP_HASH_SALT
 //   TY_PERCENT (default 20), TY_COOLDOWN_HOURS (default 0)
-//   PERIOD_MONTHS (default 1)                  // once-per-month window
-//   REQUIRE_SIGNED_IN=true|false (default false)
-//   STRICT_ONCE=true|false (default false)     // hard "once ever"
-//   EVER_TTL_DAYS=0                            // 0=persist ever lock; or N days
+//   PERIOD_MONTHS (default 1)  // calendar months
+//   REQUIRE_SIGNED_IN (default false)
+//   STRICT_ONCE (default false), EVER_TTL_DAYS (default 0)
 
 const crypto = require('crypto');
 
@@ -22,7 +23,6 @@ const SHOPIFY_SHOP        = process.env.SHOPIFY_SHOP;
 const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const API_VERSION         = '2025-07';
 
-// Upstash Redis REST
 const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
@@ -36,7 +36,7 @@ const REQUIRE_SIGNED_IN = String(process.env.REQUIRE_SIGNED_IN || 'false').toLow
 const STRICT_ONCE   = String(process.env.STRICT_ONCE || 'false').toLowerCase() === 'true';
 const EVER_TTL_DAYS = parseFloat(process.env.EVER_TTL_DAYS || '0') || 0; // 0 => persist (no TTL)
 
-// ---- Redis helpers ----
+// ---------- Upstash helpers ----------
 async function kvGet(key) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
   const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
@@ -48,15 +48,30 @@ async function kvGet(key) {
   return data?.result ? JSON.parse(data.result) : null;
 }
 
+// SET with EX seconds
 async function kvSetEx(key, value, ttlSeconds) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
-  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(
-    JSON.stringify(value)
-  )}?EX=${encodeURIComponent(ttlSeconds)}`;
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
-  });
+  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${encodeURIComponent(ttlSeconds)}`;
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
+  return r.ok;
+}
+
+// SET with NX + EX (atomic reservation). Returns true if reserved, false if already exists.
+async function kvSetNxEx(key, value, ttlSeconds) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  // Upstash REST supports NX via query param
+  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${encodeURIComponent(ttlSeconds)}&NX=1`;
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
+  if (!r.ok) return false;
+  const data = await r.json().catch(() => null);
+  // Upstash returns {"result":"OK"} on success, null/undefined on NX fail
+  return data?.result === 'OK';
+}
+
+async function kvDel(key) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  const url = `${UPSTASH_URL}/del/${encodeURIComponent(key)}`;
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
   return r.ok;
 }
 
@@ -68,12 +83,12 @@ async function kvSet(key, value) {
 }
 
 async function kvSetExDays(key, value, days) {
-  if (days <= 0) return kvSet(key, value); // persist (no TTL)
+  if (days <= 0) return kvSet(key, value); // persist
   const ttlSeconds = Math.floor(days * 86400);
   return kvSetEx(key, value, ttlSeconds);
 }
 
-// ---- Utils ----
+// ---------- Utils ----------
 function genCode(prefix = 'TY') {
   let slug = Math.random().toString(36).slice(2, 6).toUpperCase();
   while (slug.length < 4) slug += '0';
@@ -81,9 +96,20 @@ function genCode(prefix = 'TY') {
   return `${prefix}-${slug}`;
 }
 
+function isPrivate(ip) {
+  return /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[0-1])\.|^127\.|^::1$|^fc00:|^fe80:/.test(ip);
+}
 function getClientIp(req) {
-  const xf = req.headers['x-forwarded-for'];
-  if (typeof xf === 'string' && xf.length) return xf.split(',')[0].trim();
+  const cf = req.headers['cf-connecting-ip'];
+  if (cf && typeof cf === 'string') return cf.trim();
+  const trueClient = req.headers['true-client-ip'];
+  if (trueClient && typeof trueClient === 'string') return trueClient.trim();
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.length) {
+    const parts = xff.split(',').map(s => s.trim()).filter(Boolean);
+    for (const part of parts) if (!isPrivate(part)) return part;
+    return parts[0];
+  }
   return req.headers['x-real-ip'] || req.socket?.remoteAddress || '0.0.0.0';
 }
 
@@ -116,12 +142,12 @@ function setCookie(res, name, value, { maxAgeSec, path='/', httpOnly=true, sameS
   appendHeader(res, 'Set-Cookie', parts.join('; '));
 }
 
-// period helpers: month windows (calendar months)
+// Month windows (calendar)
 function addMonths(date, n) {
   const d = new Date(date);
-  const month = d.getMonth();
-  d.setMonth(month + n);
-  if (d.getMonth() !== ((month + n) % 12 + 12) % 12) d.setDate(0); // clamp overflow
+  const m = d.getMonth();
+  d.setMonth(m + n);
+  if (d.getMonth() !== ((m + n) % 12 + 12) % 12) d.setDate(0);
   return d;
 }
 function getPeriodStart(now) {
@@ -130,13 +156,83 @@ function getPeriodStart(now) {
   return start;
 }
 function getPeriodEnd(now, months) {
-  return addMonths(getPeriodStart(now), months); // exclusive bound
+  return addMonths(getPeriodStart(now), months); // exclusive
 }
-function secondsUntil(dateFromMs, dateTo) {
-  const ms = Math.max(0, dateTo.getTime() - dateFromMs);
+function secondsUntil(fromMs, dateTo) {
+  const ms = Math.max(0, dateTo.getTime() - fromMs);
   return Math.ceil(ms / 1000);
 }
 
+// ---------- Shopify helpers ----------
+async function shopifyGraphQL(query, variables) {
+  const r = await fetch(`https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`, {
+    method: 'POST',
+    headers: {
+      'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ query, variables })
+  });
+  const data = await r.json().catch(() => ({}));
+  return { ok: r.ok, data, status: r.status };
+}
+
+async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
+  const mutation = `
+    mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
+      discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
+        codeDiscountNode { id }
+        userErrors { field message }
+      }
+    }
+  `;
+  const variables = {
+    basicCodeDiscount: {
+      title: code,
+      startsAt, endsAt,
+      customerSelection: { all: true },
+      customerGets: {
+        value: { percentage: Math.min(1, Math.max(0, percent / 100)) },
+        items: { all: true }
+      },
+      combinesWith: { orderDiscounts: false, productDiscounts: true, shippingDiscounts: true },
+      usageLimit: 1,
+      appliesOncePerCustomer: true,
+      code
+    }
+  };
+  const { ok, data, status } = await shopifyGraphQL(mutation, variables);
+  if (!ok) throw new Error(`Shopify HTTP ${status}`);
+  if (data?.errors?.length) throw new Error(`GraphQL: ${JSON.stringify(data.errors)}`);
+  const errs = data?.data?.discountCodeBasicCreate?.userErrors;
+  if (errs?.length) {
+    const exists = errs.find(e => String(e.message || '').toLowerCase().includes('already exists'));
+    if (exists) throw new Error('Code collision');
+    throw new Error(`Shopify validation: ${JSON.stringify(errs)}`);
+  }
+  const node = data?.data?.discountCodeBasicCreate?.codeDiscountNode;
+  if (!node) throw new Error('No codeDiscountNode returned');
+  return node.id;
+}
+
+async function deleteDiscountByNodeId(nodeId) {
+  // Shopify mutation name for deleting codeDiscountNode
+  const mutation = `
+    mutation discountCodeDelete($id: ID!) {
+      discountCodeDelete(id: $id) {
+        deletedCodeDiscountId
+        userErrors { field message }
+      }
+    }
+  `;
+  const { ok, data, status } = await shopifyGraphQL(mutation, { id: nodeId });
+  if (!ok) throw new Error(`Shopify HTTP ${status}`);
+  const errs = data?.data?.discountCodeDelete?.userErrors;
+  if (errs?.length) throw new Error(`Delete validation: ${JSON.stringify(errs)}`);
+  return true;
+}
+
+// ---------- Handler ----------
 module.exports = async (req, res) => {
   // CORS preflight
   if (req.method === 'OPTIONS') {
@@ -152,33 +248,28 @@ module.exports = async (req, res) => {
 
     // Parse request
     const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
-    const clientExpiresAtIso = body?.expiresAt; // from front-end timer/localStorage
-    const customerIdRaw      = body?.customerId || null;     // Shopify numeric ID or GID
-    const customerEmailRaw   = body?.customerEmail || null;  // fallback if no ID
+    const clientExpiresAtIso = body?.expiresAt;
+    const customerIdRaw      = body?.customerId || null;
+    const customerEmailRaw   = body?.customerEmail || null;
 
     const cookies = parseCookies(req);
     const browserClaimed = cookies['ty_claimed'] === '1';
 
-    // Optional: require login
+    // Require login?
     if (REQUIRE_SIGNED_IN && !customerIdRaw && !customerEmailRaw) {
-      return res.status(401).json({
-        error: 'signin_required',
-        message: 'Please sign in to claim this offer.'
-      });
+      return res.status(401).json({ error: 'signin_required', message: 'Please sign in to claim this offer.' });
     }
 
-    // Normalize / hash customer identity for privacy in Redis
+    // Identity hashes
     let customerKeyHash = null;
     if (customerIdRaw) customerKeyHash = hmacHash(`id:${String(customerIdRaw).trim()}`);
     else if (customerEmailRaw) customerKeyHash = hmacHash(`email:${String(customerEmailRaw).trim().toLowerCase()}`);
 
     const now = Date.now();
     const startsAt = new Date(now);
-
-    // Default server window = 48h from now
     const serverDefaultEnd = new Date(now + 48 * 60 * 60 * 1000);
 
-    // Honor earlier client expiry (grab old timer)
+    // Honor earlier client expiry
     let chosenEndsAt = serverDefaultEnd;
     if (clientExpiresAtIso) {
       const clientEndMs = Date.parse(clientExpiresAtIso);
@@ -187,96 +278,104 @@ module.exports = async (req, res) => {
       }
     }
 
-    // ---- Keys ----
+    // Keys & period
     const ip = getClientIp(req);
     const ipHash = hmacHash(ip);
-
-    // Period window (same for all, used for per-customer and per-guest limits)
     const periodStart = getPeriodStart(now);
     const periodEndsAt = getPeriodEnd(now, PERIOD_MONTHS);
     const cy = periodStart.getUTCFullYear();
-    const cm = String(periodStart.getUTCMonth() + 1).padStart(2, '0'); // current period label
+    const cm = String(periodStart.getUTCMonth() + 1).padStart(2, '0');
     const periodLabel = `${cy}${cm}`;
 
-    const kvKeyActiveIp   = `ty:ip:${ipHash}`;                          // active IP window (48h)
-    const kvKeyEverIp     = `ty:ip:ever:${ipHash}`;                     // optional strict-ever IP
+    const kvKeyActiveIp   = `ty:ip:${ipHash}`;
+    const kvKeyEverIp     = `ty:ip:ever:${ipHash}`;
     const kvKeyCustPeriod = customerKeyHash ? `ty:cust:period:${PERIOD_MONTHS}m:${periodLabel}:${customerKeyHash}` : null;
     const kvKeyCustEver   = customerKeyHash ? `ty:cust:ever:${customerKeyHash}` : null;
+    const kvKeyGuestPeriod = `ty:guest:period:${PERIOD_MONTHS}m:${periodLabel}:${ipHash}`; // always defined; used for mirror
 
-    // NEW: guest monthly key (only when NOT signed-in)
-    const isGuest = !customerKeyHash;
-    const kvKeyGuestPeriod = isGuest ? `ty:guest:period:${PERIOD_MONTHS}m:${periodLabel}:${ipHash}` : null;
-
-    // ---- STRICT once guards ----
+    // STRICT once (browser/IP/customer)
     if (STRICT_ONCE) {
-      if (browserClaimed) {
-        return res.status(429).json({
-          error: 'already_claimed',
-          message: 'This offer was already claimed from this browser.'
-        });
-      }
+      if (browserClaimed) return res.status(429).json({ error: 'already_claimed', message: 'This offer was already claimed from this browser.' });
       const everIp = await kvGet(kvKeyEverIp);
-      if (everIp) {
-        return res.status(429).json({
-          error: 'already_claimed',
-          message: 'This offer was already claimed from your network.'
-        });
-      }
+      if (everIp) return res.status(429).json({ error: 'already_claimed', message: 'This offer was already claimed from your network.' });
       if (customerKeyHash) {
         const everCust = await kvGet(kvKeyCustEver);
-        if (everCust) {
-          return res.status(429).json({
-            error: 'already_claimed_customer',
-            message: 'This offer was already claimed on this customer account.'
-          });
-        }
+        if (everCust) return res.status(429).json({ error: 'already_claimed_customer', message: 'This offer was already claimed on this customer account.' });
       }
     }
 
-    // ---- Monthly checks (run BEFORE active-window reuse) ----
-    // Signed-in customers: per-customer period limit
+    // --------- ATOMIC MONTHLY RESERVATION ---------
+    // 1) If signed-in, reserve BOTH customer-period & guest/IP-period.
+    // 2) If guest, reserve guest/IP-period.
+    const ttlSecPeriod = secondsUntil(now, periodEndsAt);
+    const monthPayload = (marker) => ({
+      code: null, // filled after mint
+      marker,     // 'cust-reserve' or 'guest-reserve' or 'mirror'
+      firstClaimAt: new Date(now).toISOString(),
+      periodEndsAt: periodEndsAt.toISOString(),
+      nodeId: null
+    });
+
+    let reservedKeys = [];
     if (customerKeyHash && kvKeyCustPeriod) {
-      const custPeriod = await kvGet(kvKeyCustPeriod);
-      if (custPeriod) {
+      const ok1 = await kvSetNxEx(kvKeyCustPeriod, monthPayload('cust-reserve'), ttlSecPeriod);
+      if (!ok1) {
+        const existing = await kvGet(kvKeyCustPeriod);
         return res.status(429).json({
           error: 'already_claimed_monthly',
           message: 'You have already claimed this offer for the current period.',
           periodEndsAt: periodEndsAt.toISOString(),
-          code: custPeriod.code || undefined,
+          code: existing?.code || undefined,
           reused: true
         });
       }
-    }
-    // Guests: per-IP period limit (NEW)
-    if (isGuest && kvKeyGuestPeriod) {
-      const guestPeriod = await kvGet(kvKeyGuestPeriod);
-      if (guestPeriod) {
+      reservedKeys.push(kvKeyCustPeriod);
+
+      // Mirror to guest/IP monthly to prevent new-browser bypass
+      const ok2 = await kvSetNxEx(kvKeyGuestPeriod, monthPayload('mirror'), ttlSecPeriod);
+      if (!ok2) {
+        // Someone already set guest/IP monthly → abort and release customer reservation
+        await kvDel(kvKeyCustPeriod);
+        const existing = await kvGet(kvKeyGuestPeriod);
         return res.status(429).json({
           error: 'already_claimed_monthly',
           message: 'You have already claimed this offer for the current period.',
           periodEndsAt: periodEndsAt.toISOString(),
-          code: guestPeriod.code || undefined,
+          code: existing?.code || undefined,
           reused: true
         });
       }
+      reservedKeys.push(kvKeyGuestPeriod);
+    } else {
+      // Guest path: reserve guest/IP monthly
+      const ok = await kvSetNxEx(kvKeyGuestPeriod, monthPayload('guest-reserve'), ttlSecPeriod);
+      if (!ok) {
+        const existing = await kvGet(kvKeyGuestPeriod);
+        return res.status(429).json({
+          error: 'already_claimed_monthly',
+          message: 'You have already claimed this offer for the current period.',
+          periodEndsAt: periodEndsAt.toISOString(),
+          code: existing?.code || undefined,
+          reused: true
+        });
+      }
+      reservedKeys.push(kvKeyGuestPeriod);
     }
 
-    // ---- Active IP lock (reuse if still active; cooldown if set) ----
+    // --------- Active IP reuse/cooldown (secondary gate) ---------
     const existing = await kvGet(kvKeyActiveIp);
     if (existing) {
       const existingEnd = Date.parse(existing.endsAt);
       if (existingEnd > now) {
-        // still active: return same code and endsAt
+        // still active: return same code and endsAt; keep monthly reservations as-is
         return res.status(200).json({
-          ok: true,
-          code:     existing.code,
+          ok: true, reused: true,
+          code: existing.code,
           startsAt: existing.startsAt,
-          endsAt:   existing.endsAt,
-          nodeId:   existing.nodeId || null,
-          reused:   true,
+          endsAt: existing.endsAt,
+          nodeId: existing.nodeId || null,
         });
       }
-      // Optional cooldown after expiry
       if (TY_COOLDOWN_HOURS > 0) {
         const cooldownUntil = existingEnd + TY_COOLDOWN_HOURS * 3600 * 1000;
         if (cooldownUntil > now) {
@@ -291,86 +390,67 @@ module.exports = async (req, res) => {
       }
     }
 
-    // ---- Create Shopify discount (new code) ----
-    let lastErr = null;
+    // --------- Mint (we hold the monthly reservation) ---------
     let code = null;
     let nodeId = null;
+    const percent = TY_PERCENT;
 
+    // generate code and create in Shopify (retry on collisions)
     for (let attempt = 1; attempt <= 5; attempt++) {
       const tryCode = genCode('TY');
-
-      const mutation = `
-        mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
-          discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
-            codeDiscountNode { id }
-            userErrors { field message }
-          }
-        }
-      `;
-
-      const variables = {
-        basicCodeDiscount: {
-          title: tryCode,
+      try {
+        const id = await createDiscountBasic({
+          code: tryCode,
           startsAt: startsAt.toISOString(),
-          endsAt:   chosenEndsAt.toISOString(),
-
-          customerSelection: { all: true },
-
-          customerGets: {
-            value: { percentage: Math.min(1, Math.max(0, TY_PERCENT / 100)) },
-            items: { all: true }
-          },
-
-          combinesWith: {
-            orderDiscounts: false,
-            productDiscounts: true,
-            shippingDiscounts: true
-          },
-
-          usageLimit: 1,
-          appliesOncePerCustomer: true,
-
-          code: tryCode
-        }
-      };
-
-      const r = await fetch(`https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`, {
-        method: 'POST',
-        headers: {
-          'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ query: mutation, variables })
-      });
-
-      const data = await r.json().catch(() => ({}));
-
-      if (!r.ok) { lastErr = new Error(`Shopify HTTP ${r.status}`); continue; }
-      if (data?.errors?.length) { lastErr = new Error(`GraphQL: ${JSON.stringify(data.errors)}`); continue; }
-
-      const errs = data?.data?.discountCodeBasicCreate?.userErrors;
-      if (errs?.length) {
-        const existsErr = errs.find(e => String(e.message || '').toLowerCase().includes('already exists'));
-        if (existsErr) { lastErr = new Error('Code collision, retrying…'); continue; }
-        return res.status(400).json({ error: 'Shopify validation error', userErrors: errs });
+          endsAt: chosenEndsAt.toISOString(),
+          percent
+        });
+        code = tryCode;
+        nodeId = id;
+        break;
+      } catch (err) {
+        if (String(err?.message || '').includes('Code collision')) continue; // retry different code
+        // Mint failed → release reservations so caller can retry later
+        for (const k of reservedKeys) await kvDel(k);
+        throw err;
       }
-
-      const node = data?.data?.discountCodeBasicCreate?.codeDiscountNode;
-      if (!node) { lastErr = new Error('No codeDiscountNode returned'); continue; }
-
-      code   = tryCode;
-      nodeId = node.id;
-      break;
     }
 
     if (!code) {
-      console.error('Failed to create code', lastErr);
+      // release reservations (defensive)
+      for (const k of reservedKeys) await kvDel(k);
       return res.status(502).json({ error: 'Failed to create discount code' });
     }
 
-    // ---- Save locks + set cookie ----
+    // --------- Sanity check & write monthly record ---------
+    // If the reserved monthly key somehow already contains a different code,
+    // delete the newly minted discount and return monthly error.
+    const monthlyRecord = {
+      code,
+      nodeId,
+      firstClaimAt: new Date(now).toISOString(),
+      periodEndsAt: periodEndsAt.toISOString()
+    };
 
-    // Active IP lock TTL = time until chosenEndsAt + optional cooldown
+    // Write to the keys we reserved (overwrite value, same TTL window)
+    await kvSet(kvKeyGuestPeriod, monthlyRecord);
+    if (customerKeyHash && kvKeyCustPeriod) await kvSet(kvKeyCustPeriod, monthlyRecord);
+
+    // Re-read to detect conflict (extremely unlikely because of NX, but safe)
+    const checkGuest = await kvGet(kvKeyGuestPeriod);
+    if (checkGuest && checkGuest.code && checkGuest.code !== code) {
+      // Another code already recorded for this month → rollback this mint
+      try { await deleteDiscountByNodeId(nodeId); } catch (_) {}
+      return res.status(429).json({
+        error: 'already_claimed_monthly',
+        message: 'You have already claimed this offer for the current period.',
+        periodEndsAt: periodEndsAt.toISOString(),
+        code: checkGuest.code,
+        reused: true
+      });
+    }
+
+    // --------- Active IP lock (48h + cooldown) ---------
     const ttlSecActive =
       Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000)) +
       Math.max(0, Math.floor(TY_COOLDOWN_HOURS * 3600));
@@ -382,43 +462,15 @@ module.exports = async (req, res) => {
       nodeId
     }, ttlSecActive);
 
-    // Ever-claimed locks (if STRICT_ONCE)
+    // Ever-claimed locks (optional strict once)
     if (STRICT_ONCE) {
-      await kvSetExDays(kvKeyEverIp, {
-        code, firstClaimAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId
-      }, EVER_TTL_DAYS);
-      if (customerKeyHash) {
-        await kvSetExDays(kvKeyCustEver, {
-          code, firstClaimAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId
-        }, EVER_TTL_DAYS);
+      await kvSetExDays(kvKeyEverIp, { code, firstClaimAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId }, EVER_TTL_DAYS);
+      if (customerKeyHash && kvKeyCustEver) {
+        await kvSetExDays(kvKeyCustEver, { code, firstClaimAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId }, EVER_TTL_DAYS);
       }
     }
 
-    // Per-customer monthly lock (if signed-in)
-    if (customerKeyHash && kvKeyCustPeriod) {
-      const ttlSecPeriod = secondsUntil(now, periodEndsAt);
-      await kvSetEx(kvKeyCustPeriod, {
-        code,
-        customerKeyHash,
-        periodEndsAt: periodEndsAt.toISOString(),
-        firstClaimAt: startsAt.toISOString(),
-        nodeId
-      }, Math.max(1, ttlSecPeriod));
-    }
-
-    // Per-guest monthly lock (NEW)
-    if (isGuest && kvKeyGuestPeriod) {
-      const ttlSecPeriod = secondsUntil(now, periodEndsAt);
-      await kvSetEx(kvKeyGuestPeriod, {
-        code,
-        ipHash,
-        periodEndsAt: periodEndsAt.toISOString(),
-        firstClaimAt: startsAt.toISOString(),
-        nodeId
-      }, Math.max(1, ttlSecPeriod));
-    }
-
-    // Browser cookie: block same browser from minting again (matches active IP window; strict -> long)
+    // Browser cookie to dampen repeats from same browser
     const cookieMaxAge = STRICT_ONCE ? 10 * 365 * 24 * 3600 : ttlSecActive;
     setCookie(res, 'ty_claimed', '1', { maxAgeSec: cookieMaxAge });
 
@@ -430,8 +482,9 @@ module.exports = async (req, res) => {
       endsAt:   chosenEndsAt.toISOString(),
       nodeId,
       customerLimitedByMonths: customerKeyHash ? PERIOD_MONTHS : undefined,
-      guestLimitedByMonths: isGuest ? PERIOD_MONTHS : undefined
+      guestLimitedByMonths: !customerKeyHash ? PERIOD_MONTHS : undefined
     });
+
   } catch (e) {
     console.error('Unhandled error creating discount', e);
     return res.status(500).json({ error: 'Unhandled error', message: e?.message || String(e) });
