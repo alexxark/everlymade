@@ -96,13 +96,17 @@ async function kvSetEx(key, value, ttlSeconds) {
 async function kvSetNxEx(key, value, ttlSeconds) {
   const ttl = encodeURIComponent(ttlSeconds);
   const url = KV_STYLE === 'upstash'
-    ? `${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${ttl}&NX=1`
+    // Upstash requires uppercase EX and NX=true
+    ? `${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${ttl}&NX=true`
+    // Vercel KV requires lowercase ex/nx
     : `${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?ex=${ttl}&nx=true`;
-  const r = await fetch(url, { method:'POST', headers:{ Authorization:`Bearer ${KV_TOKEN}` }});
+
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${KV_TOKEN}` } });
   if (!r.ok) throw new Error(`KV SET NX EX failed: ${r.status}`);
-  const data = await r.json().catch(()=> null);
+  const data = await r.json().catch(() => null);
   return data?.result === 'OK';
 }
+
 
 async function kvDel(key) {
   const r = await fetch(`${KV_URL}/del/${encodeURIComponent(key)}`, {
