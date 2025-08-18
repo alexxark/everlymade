@@ -1,6 +1,8 @@
 // api/thankyouclaim.js — CommonJS (Vercel /api/*)
 // Per-visitor monthly limit + optional strict-once; supports Upstash Redis REST or Vercel KV REST.
-// Active-IP reuse is handled FIRST; and reuse works across devices via IP-only key, plus legacy IP+UA compatibility.
+// Active-IP reuse is handled FIRST; reuse works across devices via exact-IP key, legacy IP+UA key,
+// and (optionally) "household" network prefix keys (/24 for IPv4, /64 for IPv6). When a reuse match
+// is found, we mirror the record to all keys for the remaining TTL so subsequent devices align.
 
 // --- Required ENVs ---
 // KV (choose one pair):
@@ -20,8 +22,9 @@ REQUIRE_SIGNED_IN        (default false)
 STRICT_ONCE              (default false)
 EVER_TTL_DAYS            (default 0)
 REQUIRE_REAL_IP_FOR_GUEST (default false)
-HASH_IP_WITH_UA          (default false)   // affects visitor hash only; active-IP key ignores UA but we stay backward-compatible
+HASH_IP_WITH_UA          (default false)   // affects visitor hash only; active-IP key ignores UA except for legacy check
 VISITOR_KEY_MODE         (default "cookie+ip") // "cookie" | "ip" | "cookie+ip"
+ACTIVE_IP_SCOPE          (default "exact") // "exact" | "household"  -> adds IPv4 /24 & IPv6 /64 keys for reuse
 */
 
 const crypto = require('crypto');
@@ -37,8 +40,8 @@ const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST
 
 function kvStyle(url) {
   const u = (url || '').toLowerCase();
-  if (u.includes('vercel-storage.com')) return 'vercel'; // ex=, nx=true
-  if (u.includes('.upstash.io'))        return 'upstash'; // EX=, NX=...
+  if (u.includes('vercel-storage.com') || u.includes('kv.vercel-storage.com')) return 'vercel'; // ex=, nx=true
+  if (u.includes('.upstash.io'))                                            return 'upstash'; // EX=, NX=...
   return 'vercel';
 }
 const KV_STYLE = kvStyle(KV_URL);
@@ -57,6 +60,7 @@ const EVER_TTL_DAYS = parseFloat(process.env.EVER_TTL_DAYS || '0') || 0;
 const REQUIRE_REAL_IP_FOR_GUEST = String(process.env.REQUIRE_REAL_IP_FOR_GUEST || 'false').toLowerCase() === 'true';
 const HASH_IP_WITH_UA           = String(process.env.HASH_IP_WITH_UA || 'false').toLowerCase() === 'true';
 const VISITOR_KEY_MODE          = String(process.env.VISITOR_KEY_MODE || 'cookie+ip').toLowerCase();
+const ACTIVE_IP_SCOPE           = String(process.env.ACTIVE_IP_SCOPE || 'exact').toLowerCase(); // 'exact' | 'household'
 
 // ----- Env guard -----
 function assertEnvOrThrow() {
@@ -68,7 +72,7 @@ function assertEnvOrThrow() {
   if (missing.length) throw new Error(`Missing ENV: ${missing.join(', ')}`);
 }
 
-// ----- KV helpers (with auto-fallback between styles on 400) -----
+// ----- KV helpers (with style fallbacks for 400s) -----
 async function kvGet(key) {
   if (!KV_URL || !KV_TOKEN || !key) return null;
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
@@ -102,13 +106,13 @@ async function kvSetNxEx(key, value, ttlSeconds) {
   const ttl = encodeURIComponent(ttlSeconds);
   const base = `${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}`;
 
-  // Try a small matrix of variants to satisfy both providers and picky deployments.
+  // Try a small matrix of variants to satisfy both providers and deployments.
   const candidates = [];
   if (KV_STYLE === 'upstash') {
     candidates.push(`${base}?EX=${ttl}&NX=true`);
     candidates.push(`${base}?EX=${ttl}&NX=1`);
     candidates.push(`${base}?EX=${ttl}&NX`);          // bare NX
-    candidates.push(`${base}?ex=${ttl}&nx=true`);     // fallback case
+    candidates.push(`${base}?ex=${ttl}&nx=true`);     // fallback shape
   } else {
     candidates.push(`${base}?ex=${ttl}&nx=true`);
     candidates.push(`${base}?EX=${ttl}&NX=true`);
@@ -163,20 +167,8 @@ function genCode(prefix = 'TY') {
 function isPrivateIp(ip) {
   return /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[0-1])\.|^127\.|^::1$|^fc00:|^fe80:/.test(ip);
 }
-function getClientIpDetailed(req) {
-  const pick = v => (typeof v === 'string' && v.trim()) ? v.trim() : '';
-  const cf  = pick(req.headers['cf-connecting-ip']);        if (cf)  return { ip: cf, kind: 'cf'  };
-  const tci = pick(req.headers['true-client-ip']);          if (tci) return { ip: tci, kind: 'tci' };
-  const vff = pick(req.headers['x-vercel-forwarded-for']);  if (vff) return { ip: vff.split(',')[0].trim().replace(/^::ffff:/, ''), kind: 'vff' };
-  const xff = pick(req.headers['x-forwarded-for']);
-  if (xff) {
-    const parts = xff.split(',').map(s => s.trim()).filter(Boolean).map(s => s.replace(/^::ffff:/, ''));
-    for (const ip of parts) { if (!isPrivateIp(ip)) return { ip, kind: 'xff' }; }
-    if (parts.length) return { ip: parts[0], kind: 'xff' };
-  }
-  const xr = pick(req.headers['x-real-ip']);                if (xr)  return { ip: xr.replace(/^::ffff:/, ''), kind: 'xr' };
-  const sock = pick(req.socket?.remoteAddress);             if (sock) return { ip: sock.replace(/^::ffff:/, ''), kind: 'sock' };
-  return { ip: 'pseudo', kind: 'pseudo' };
+function normalizeIp(ip) {
+  return String(ip || '').replace(/^::ffff:/, '');
 }
 function hmacHash(input, salt = IP_HASH_SALT) {
   return crypto.createHmac('sha256', salt).update(String(input)).digest('hex');
@@ -214,18 +206,33 @@ function getPeriodStart(nowMs) { const d = new Date(nowMs); d.setUTCDate(1); d.s
 function getPeriodEnd(nowMs, months) { return addMonths(getPeriodStart(nowMs), months); }
 function secondsUntil(fromMs, toDate) { return Math.max(1, Math.ceil((toDate.getTime() - fromMs)/1000)); }
 
-// ----- Active-IP compatibility helpers -----
-function normalizeIp(ip) {
-  return String(ip || '').replace(/^::ffff:/, '');
+// ----- Active-IP household helpers -----
+function ipV4Prefix(ip) {
+  const m = String(ip || '').match(/^(\d+)\.(\d+)\.(\d+)\.\d+$/);
+  return m ? `${m[1]}.${m[2]}.${m[3]}.0/24` : null;
+}
+function ipV6Prefix(ip) {
+  const parts = String(ip || '').split(':');
+  if (parts.length < 4) return null;
+  return `${parts.slice(0,4).join(':')}::/64`;
 }
 function buildActiveIpHashes(ip, ua) {
   const cleanIp = normalizeIp(ip);
-  const hashes = [];
-  // Current (IP-only)
-  hashes.push(hmacHash(cleanIp));
-  // Legacy (IP+UA) — earlier deployments may have stored like this
-  if (ua) hashes.push(hmacHash(`${cleanIp}|${ua}`));
-  return Array.from(new Set(hashes));
+  const hashes = new Set();
+
+  // exact IP (current canonical)
+  hashes.add(hmacHash(cleanIp));
+  // legacy exact (IP+UA) — earlier deployments may have stored like this
+  if (ua) hashes.add(hmacHash(`${cleanIp}|${ua}`));
+
+  // optional household scope
+  if (ACTIVE_IP_SCOPE === 'household') {
+    const v4p = ipV4Prefix(cleanIp);
+    const v6p = cleanIp.includes(':') ? ipV6Prefix(cleanIp) : null;
+    if (v4p) hashes.add(hmacHash(`net:${v4p}`));
+    if (v6p) hashes.add(hmacHash(`net:${v6p}`));
+  }
+  return Array.from(hashes);
 }
 
 // ----- Visitor identity -----
@@ -311,7 +318,11 @@ function setDebugHeaders(res, obj = {}) {
   for (const [k, v] of Object.entries(obj)) if (v != null)
     res.setHeader(`X-TY-${k}`, typeof v === 'string' ? v : JSON.stringify(v));
   res.setHeader('Access-Control-Expose-Headers',
-    ['X-TY-ipKind','X-TY-ipHash','X-TY-ipHashes','X-TY-visitorHash','X-TY-visitorMode','X-TY-guestMonthKey','X-TY-custMonthKey','X-TY-activeIpKey','X-TY-activeIpKeys','X-TY-reason','X-TY-kvStyle'].join(', ')
+    [
+      'X-TY-ipKind','X-TY-ipHash','X-TY-ipHashes','X-TY-visitorHash','X-TY-visitorMode',
+      'X-TY-guestMonthKey','X-TY-custMonthKey','X-TY-activeIpKey','X-TY-activeIpKeys',
+      'X-TY-reason','X-TY-kvStyle','X-TY-scope'
+    ].join(', ')
   );
 }
 function getDebugFlag(req, body) {
@@ -340,7 +351,7 @@ module.exports = async (req, res) => {
   catch (e) {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    setDebugHeaders(res, { reason: 'server_misconfig', error: String(e?.message || e), apiVersion: API_VERSION, shop: SHOPIFY_SHOP, kvStyle: KV_STYLE });
+    setDebugHeaders(res, { reason: 'server_misconfig', error: String(e?.message || e), apiVersion: API_VERSION, shop: SHOPIFY_SHOP, kvStyle: KV_STYLE, scope: ACTIVE_IP_SCOPE });
     return res.status(500).json({ error: 'server_misconfig', message: String(e?.message || e) });
   }
 
@@ -384,7 +395,7 @@ module.exports = async (req, res) => {
     const hasRealIp = ipInfo.kind !== 'pseudo';
     const uaForHash = (req.headers['user-agent'] || '').toString().slice(0, 200);
 
-    // Build BOTH possible active-IP hashes (IP-only and legacy IP+UA); de-duped
+    // Build active-IP hashes: exact, legacy IP+UA, and optional household (/24 or /64)
     const activeIpHashes = hasRealIp ? buildActiveIpHashes(ipInfo.ip, uaForHash) : [];
     const activeIpKeys   = activeIpHashes.map(h => `ty:ip:${h}`);
 
@@ -403,7 +414,7 @@ module.exports = async (req, res) => {
     const periodLabel = `${cy}${cm}`;
 
     // Keys
-    const kvKeyEverIp      = hasRealIp ? `ty:ip:ever:${activeIpHashes[0]}` : null; // use first (IP-only) for "ever"
+    const kvKeyEverIp      = hasRealIp ? `ty:ip:ever:${hmacHash(normalizeIp(ipInfo.ip))}` : null; // store "ever" on the exact IP hash only
     const kvKeyGuestPeriod = `ty:guest:period:${PERIOD_MONTHS}m:${periodLabel}:${visitorHash}`;
     const kvKeyCustPeriod  = customerKeyHash ? `ty:cust:period:${PERIOD_MONTHS}m:${periodLabel}:${customerKeyHash}` : null;
     const kvKeyCustEver    = customerKeyHash ? `ty:cust:ever:${customerKeyHash}` : null;
@@ -418,7 +429,8 @@ module.exports = async (req, res) => {
       custMonthKey: kvKeyCustPeriod,
       activeIpKey: activeIpKeys[0],
       activeIpKeys: activeIpKeys,
-      kvStyle: KV_STYLE
+      kvStyle: KV_STYLE,
+      scope: ACTIVE_IP_SCOPE
     });
 
     if (!hasRealIp && !customerKeyHash && REQUIRE_REAL_IP_FOR_GUEST) {
@@ -430,8 +442,8 @@ module.exports = async (req, res) => {
     if (DEBUG) {
       const existingGuest = await kvGet(kvKeyGuestPeriod).catch(e => ({ kvError: String(e?.message || e) }));
       const existingCust  = kvKeyCustPeriod ? await kvGet(kvKeyCustPeriod).catch(e => ({ kvError: String(e?.message || e) })) : null;
-      let existingAct = null;
-      for (const k of activeIpKeys) { existingAct = await kvGet(k).catch(()=>null); if (existingAct) break; }
+      let existingAct = null, activeHitKey = null;
+      for (const k of activeIpKeys) { existingAct = await kvGet(k).catch(()=>null); if (existingAct) { activeHitKey = k; break; } }
       const existingEverI = kvKeyEverIp ? await kvGet(kvKeyEverIp).catch(e => ({ kvError: String(e?.message || e) })) : null;
       const existingEverC = kvKeyCustEver ? await kvGet(kvKeyCustEver).catch(e => ({ kvError: String(e?.message || e) })) : null;
 
@@ -451,7 +463,7 @@ module.exports = async (req, res) => {
         existingGuest && !existingGuest.kvError ? 'monthly-lock-guest' :
         activeOk ? 'active-ip-reuse' : 'would-mint';
 
-      setDebugHeaders(res, { debug: '1', wouldBlock: String(wouldBlock), reason });
+      setDebugHeaders(res, { debug: '1', wouldBlock: String(wouldBlock), reason, activeHitKey });
       return res.status(200).json({
         ok: !wouldBlock,
         debug: true,
@@ -462,7 +474,7 @@ module.exports = async (req, res) => {
       });
     }
 
-    // -------- Active IP reuse (DO THIS FIRST) --------
+    // -------- Active IP reuse (FIRST) --------
     if (hasRealIp && activeIpKeys.length) {
       try {
         for (const k of activeIpKeys) {
@@ -470,6 +482,14 @@ module.exports = async (req, res) => {
           if (!existing) continue;
           const existingEnd = Date.parse(existing.endsAt);
           if (existingEnd > now) {
+            // Mirror to all keys so the whole household (and legacy) aligns immediately
+            try {
+              const ttlLeft = Math.max(1, Math.ceil((existingEnd - now) / 1000));
+              const payload = { code: existing.code, startsAt: existing.startsAt, endsAt: existing.endsAt, nodeId: existing.nodeId || null };
+              for (const mk of activeIpKeys) {
+                await kvSetEx(mk, payload, ttlLeft);
+              }
+            } catch {}
             return res.status(200).json({
               ok: true, reused: true, reason: 'active-ip-reuse',
               code: existing.code, startsAt: existing.startsAt, endsAt: existing.endsAt,
@@ -603,7 +623,7 @@ module.exports = async (req, res) => {
       });
     }
 
-    // Active IP lock through expiry (+ cooldown if any) — dual-write (IP-only and legacy IP+UA)
+    // Active IP lock through expiry (+ cooldown if any) — write to all active keys (exact, legacy, household)
     if (hasRealIp && activeIpKeys.length) {
       const ttlSecActive =
         Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000)) +
@@ -628,7 +648,7 @@ module.exports = async (req, res) => {
     const cookieMaxAge = STRICT_ONCE ? 10 * 365 * 24 * 3600 : Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000));
     setCookie(res, 'ty_claimed', '1', { maxAgeSec: cookieMaxAge });
 
-    setDebugHeaders(res, { reason: 'minted', code, nodeId, endsAt: chosenEndsAt.toISOString(), ipKind: ipInfo.kind, apiVersion: API_VERSION, kvStyle: KV_STYLE });
+    setDebugHeaders(res, { reason: 'minted', code, nodeId, endsAt: chosenEndsAt.toISOString(), ipKind: ipInfo.kind, apiVersion: API_VERSION, kvStyle: KV_STYLE, scope: ACTIVE_IP_SCOPE });
 
     return res.status(200).json({
       ok: true, reason: 'minted',
@@ -639,7 +659,24 @@ module.exports = async (req, res) => {
 
   } catch (e) {
     console.error('Unhandled error creating discount', e);
-    setDebugHeaders(res, { reason: 'server-error', error: String(e?.message || e), apiVersion: API_VERSION });
+    setDebugHeaders(res, { reason: 'server-error', error: String(e?.message || e), apiVersion: API_VERSION, scope: ACTIVE_IP_SCOPE });
     return res.status(500).json({ error: 'Unhandled error', message: e?.message || String(e) });
   }
 };
+
+// Helper to find client IP info
+function getClientIpDetailed(req) {
+  const pick = v => (typeof v === 'string' && v.trim()) ? v.trim() : '';
+  const cf  = pick(req.headers['cf-connecting-ip']);        if (cf)  return { ip: cf, kind: 'cf'  };
+  const tci = pick(req.headers['true-client-ip']);          if (tci) return { ip: tci, kind: 'tci' };
+  const vff = pick(req.headers['x-vercel-forwarded-for']);  if (vff) return { ip: vff.split(',')[0].trim().replace(/^::ffff:/, ''), kind: 'vff' };
+  const xff = pick(req.headers['x-forwarded-for']);
+  if (xff) {
+    const parts = xff.split(',').map(s => s.trim()).filter(Boolean).map(s => s.replace(/^::ffff:/, ''));
+    for (const ip of parts) { if (!isPrivateIp(ip)) return { ip, kind: 'xff' }; }
+    if (parts.length) return { ip: parts[0], kind: 'xff' };
+  }
+  const xr = pick(req.headers['x-real-ip']);                if (xr)  return { ip: xr.replace(/^::ffff:/, ''), kind: 'xr' };
+  const sock = pick(req.socket?.remoteAddress);             if (sock) return { ip: sock.replace(/^::ffff:/, ''), kind: 'sock' };
+  return { ip: 'pseudo', kind: 'pseudo' };
+}
