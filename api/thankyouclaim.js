@@ -20,7 +20,7 @@ REQUIRE_SIGNED_IN        (default false)
 STRICT_ONCE              (default false)
 EVER_TTL_DAYS            (default 0)
 REQUIRE_REAL_IP_FOR_GUEST (default false)
-HASH_IP_WITH_UA          (default false)
+HASH_IP_WITH_UA          (default false)   // affects visitor hash only; active-IP key ignores UA
 VISITOR_KEY_MODE         (default "cookie+ip") // "cookie" | "ip" | "cookie+ip"
 */
 
@@ -35,11 +35,11 @@ const API_VERSION         = process.env.SHOPIFY_API_VERSION || '2025-07';
 const KV_URL   = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// Decide param style based on host
+// Decide param style based on host (we still auto-fallback on 400s)
 function kvStyle(url) {
   const u = (url || '').toLowerCase();
   if (u.includes('vercel-storage.com')) return 'vercel'; // ex=, nx=true
-  if (u.includes('.upstash.io'))        return 'upstash'; // EX=, NX=true (works), NX=1 also ok for some routes but we prefer true
+  if (u.includes('.upstash.io'))        return 'upstash'; // EX=, NX=...
   return 'vercel';
 }
 const KV_STYLE = kvStyle(KV_URL);
@@ -99,19 +99,35 @@ async function kvSetEx(key, value, ttlSeconds) {
 }
 
 async function kvSetNxEx(key, value, ttlSeconds) {
+  if (!KV_URL || !KV_TOKEN) throw new Error('KV not configured');
   const ttl = encodeURIComponent(ttlSeconds);
-  const primary = KV_STYLE === 'upstash'
-    ? `${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${ttl}&NX=true`
-    : `${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?ex=${ttl}&nx=true`;
-  const fallback = KV_STYLE === 'upstash'
-    ? `${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?ex=${ttl}&nx=true`
-    : `${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${ttl}&NX=true`;
+  const base = `${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}`;
 
-  let r = await fetch(primary, { method: 'POST', headers: { Authorization: `Bearer ${KV_TOKEN}` }});
-  if (r.status === 400) r = await fetch(fallback, { method: 'POST', headers: { Authorization: `Bearer ${KV_TOKEN}` }});
-  if (!r.ok) throw new Error(`KV SET NX EX failed: ${r.status}`);
-  const data = await r.json().catch(() => null);
-  return data?.result === 'OK';
+  // Try a small matrix of variants to satisfy both providers and picky deployments.
+  const candidates = [];
+  if (KV_STYLE === 'upstash') {
+    candidates.push(`${base}?EX=${ttl}&NX=true`);
+    candidates.push(`${base}?EX=${ttl}&NX=1`);
+    candidates.push(`${base}?EX=${ttl}&NX`);          // bare NX
+    candidates.push(`${base}?ex=${ttl}&nx=true`);     // fallback case
+  } else {
+    candidates.push(`${base}?ex=${ttl}&nx=true`);
+    candidates.push(`${base}?EX=${ttl}&NX=true`);
+    candidates.push(`${base}?EX=${ttl}&NX=1`);
+    candidates.push(`${base}?EX=${ttl}&NX`);
+  }
+
+  let lastResp = null;
+  for (const url of candidates) {
+    const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${KV_TOKEN}` } });
+    lastResp = r;
+    if (r.status === 400) continue;  // try the next variant
+    if (!r.ok) throw new Error(`KV SET NX EX failed: ${r.status}`);
+    const data = await r.json().catch(() => null);
+    return data?.result === 'OK';    // NX success → 'OK', exists → null
+  }
+
+  throw new Error(`KV SET NX EX failed: ${lastResp ? lastResp.status : 'unknown'}`);
 }
 
 async function kvDel(key) {
@@ -351,12 +367,14 @@ module.exports = async (req, res) => {
     }
 
     // Identity
-    const ipInfo = getClientIpDetailed(req);
+    const ipInfo    = getClientIpDetailed(req);
     const hasRealIp = ipInfo.kind !== 'pseudo';
     const uaForHash = (req.headers['user-agent'] || '').toString().slice(0, 200);
-    const ipHash = hasRealIp ? hmacHash(HASH_IP_WITH_UA ? `${ipInfo.ip}|${uaForHash}` : ipInfo.ip) : null;
 
-    const visitorId = getOrCreateVisitorId(req, res);
+    // IMPORTANT: Active-IP key ignores UA so desktop/phone/VPN share the 48h reuse.
+    const ipHashActive = hasRealIp ? hmacHash(ipInfo.ip) : null;
+
+    const visitorId   = getOrCreateVisitorId(req, res);
     const visitorHash = makeVisitorHash({
       mode: VISITOR_KEY_MODE, vid: visitorId,
       hasRealIp, ip: ipInfo.ip, ua: uaForHash
@@ -370,15 +388,21 @@ module.exports = async (req, res) => {
     const periodLabel = `${cy}${cm}`;
 
     // Keys
-    const kvKeyActiveIp    = hasRealIp ? `ty:ip:${ipHash}` : null;
-    const kvKeyEverIp      = hasRealIp ? `ty:ip:ever:${ipHash}` : null;
+    const kvKeyActiveIp    = hasRealIp ? `ty:ip:${ipHashActive}` : null;
+    const kvKeyEverIp      = hasRealIp ? `ty:ip:ever:${ipHashActive}` : null;
     const kvKeyGuestPeriod = `ty:guest:period:${PERIOD_MONTHS}m:${periodLabel}:${visitorHash}`;
     const kvKeyCustPeriod  = customerKeyHash ? `ty:cust:period:${PERIOD_MONTHS}m:${periodLabel}:${customerKeyHash}` : null;
     const kvKeyCustEver    = customerKeyHash ? `ty:cust:ever:${customerKeyHash}` : null;
 
     setDebugHeaders(res, {
-      ipKind: ipInfo.kind, ipHash, visitorHash, visitorMode: VISITOR_KEY_MODE,
-      guestMonthKey: kvKeyGuestPeriod, custMonthKey: kvKeyCustPeriod, activeIpKey: kvKeyActiveIp, kvStyle: KV_STYLE
+      ipKind: ipInfo.kind,
+      ipHash: ipHashActive,
+      visitorHash,
+      visitorMode: VISITOR_KEY_MODE,
+      guestMonthKey: kvKeyGuestPeriod,
+      custMonthKey: kvKeyCustPeriod,
+      activeIpKey: kvKeyActiveIp,
+      kvStyle: KV_STYLE
     });
 
     if (!hasRealIp && !customerKeyHash && REQUIRE_REAL_IP_FOR_GUEST) {
@@ -412,7 +436,9 @@ module.exports = async (req, res) => {
 
       setDebugHeaders(res, { debug: '1', wouldBlock: String(wouldBlock), reason });
       return res.status(200).json({
-        ok: !wouldBlock, debug: true, reason,
+        ok: !wouldBlock,
+        debug: true,
+        reason,
         keys: { kvKeyGuestPeriod, kvKeyCustPeriod, kvKeyActiveIp, kvKeyEverIp, kvKeyCustEver },
         existing: { guestMonthly: existingGuest, customerMonthly: existingCust, activeIp: existingAct, everIp: existingEverI, everCustomer: existingEverC },
         note: 'No writes performed in debug mode.'
@@ -436,7 +462,8 @@ module.exports = async (req, res) => {
             const cooldownUntil = existingEnd + TY_COOLDOWN_HOURS * 3600 * 1000;
             if (cooldownUntil > now) {
               return res.status(429).json({
-                error: 'rate_limited', reason: 'cooldown-active',
+                error: 'rate_limited',
+                reason: 'cooldown-active',
                 message: 'Already claimed from your network. Try again later.',
                 code: existing.code, endsAt: existing.endsAt,
                 cooldownUntil: new Date(cooldownUntil).toISOString(),
@@ -477,9 +504,11 @@ module.exports = async (req, res) => {
         if (!ok1) {
           const existing = await kvGet(kvKeyCustPeriod);
           return res.status(429).json({
-            error: 'already_claimed_monthly', reason: 'monthly-lock-customer',
+            error: 'already_claimed_monthly',
+            reason: 'monthly-lock-customer',
             periodEndsAt: periodEndsAt.toISOString(),
-            code: existing?.code || undefined, reused: true
+            code: existing?.code || undefined,
+            reused: true
           });
         }
         reservedKeys.push(kvKeyCustPeriod);
@@ -489,9 +518,11 @@ module.exports = async (req, res) => {
           try { await kvDel(kvKeyCustPeriod); } catch {}
           const existing = await kvGet(kvKeyGuestPeriod);
           return res.status(429).json({
-            error: 'already_claimed_monthly', reason: 'monthly-lock-guest',
+            error: 'already_claimed_monthly',
+            reason: 'monthly-lock-guest',
             periodEndsAt: periodEndsAt.toISOString(),
-            code: existing?.code || undefined, reused: true
+            code: existing?.code || undefined,
+            reused: true
           });
         }
         reservedKeys.push(kvKeyGuestPeriod);
@@ -500,9 +531,11 @@ module.exports = async (req, res) => {
         if (!ok) {
           const existing = await kvGet(kvKeyGuestPeriod);
           return res.status(429).json({
-            error: 'already_claimed_monthly', reason: 'monthly-lock-guest',
+            error: 'already_claimed_monthly',
+            reason: 'monthly-lock-guest',
             periodEndsAt: periodEndsAt.toISOString(),
-            code: existing?.code || undefined, reused: true
+            code: existing?.code || undefined,
+            reused: true
           });
         }
         reservedKeys.push(kvKeyGuestPeriod);
@@ -546,7 +579,8 @@ module.exports = async (req, res) => {
     if (checkGuest && checkGuest.code && checkGuest.code !== code) {
       try { await deleteDiscountByNodeId(nodeId); } catch {}
       return res.status(429).json({
-        error: 'already_claimed_monthly', reason: 'monthly-lock-race',
+        error: 'already_claimed_monthly',
+        reason: 'monthly-lock-race',
         periodEndsAt: periodEndsAt.toISOString(),
         code: checkGuest.code, revokedNewMint: true, reused: true, ipKind: ipInfo.kind
       });
