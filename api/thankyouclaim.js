@@ -1,6 +1,6 @@
 // api/thankyouclaim.js — CommonJS (Vercel /api/*)
 // Per-visitor monthly limit + optional strict-once; supports Upstash Redis REST or Vercel KV REST.
-// Active-IP reuse is handled FIRST so a previously minted code is returned even if monthly reservation would fail.
+// Active-IP reuse is handled FIRST; and reuse works across devices via IP-only key, plus legacy IP+UA compatibility.
 
 // --- Required ENVs ---
 // KV (choose one pair):
@@ -20,7 +20,7 @@ REQUIRE_SIGNED_IN        (default false)
 STRICT_ONCE              (default false)
 EVER_TTL_DAYS            (default 0)
 REQUIRE_REAL_IP_FOR_GUEST (default false)
-HASH_IP_WITH_UA          (default false)   // affects visitor hash only; active-IP key ignores UA
+HASH_IP_WITH_UA          (default false)   // affects visitor hash only; active-IP key ignores UA but we stay backward-compatible
 VISITOR_KEY_MODE         (default "cookie+ip") // "cookie" | "ip" | "cookie+ip"
 */
 
@@ -35,7 +35,6 @@ const API_VERSION         = process.env.SHOPIFY_API_VERSION || '2025-07';
 const KV_URL   = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// Decide param style based on host (we still auto-fallback on 400s)
 function kvStyle(url) {
   const u = (url || '').toLowerCase();
   if (u.includes('vercel-storage.com')) return 'vercel'; // ex=, nx=true
@@ -215,6 +214,20 @@ function getPeriodStart(nowMs) { const d = new Date(nowMs); d.setUTCDate(1); d.s
 function getPeriodEnd(nowMs, months) { return addMonths(getPeriodStart(nowMs), months); }
 function secondsUntil(fromMs, toDate) { return Math.max(1, Math.ceil((toDate.getTime() - fromMs)/1000)); }
 
+// ----- Active-IP compatibility helpers -----
+function normalizeIp(ip) {
+  return String(ip || '').replace(/^::ffff:/, '');
+}
+function buildActiveIpHashes(ip, ua) {
+  const cleanIp = normalizeIp(ip);
+  const hashes = [];
+  // Current (IP-only)
+  hashes.push(hmacHash(cleanIp));
+  // Legacy (IP+UA) — earlier deployments may have stored like this
+  if (ua) hashes.push(hmacHash(`${cleanIp}|${ua}`));
+  return Array.from(new Set(hashes));
+}
+
 // ----- Visitor identity -----
 function getOrCreateVisitorId(req, res) {
   const cookies = parseCookies(req);
@@ -298,7 +311,7 @@ function setDebugHeaders(res, obj = {}) {
   for (const [k, v] of Object.entries(obj)) if (v != null)
     res.setHeader(`X-TY-${k}`, typeof v === 'string' ? v : JSON.stringify(v));
   res.setHeader('Access-Control-Expose-Headers',
-    ['X-TY-ipKind','X-TY-ipHash','X-TY-visitorHash','X-TY-visitorMode','X-TY-guestMonthKey','X-TY-custMonthKey','X-TY-activeIpKey','X-TY-reason','X-TY-kvStyle'].join(', ')
+    ['X-TY-ipKind','X-TY-ipHash','X-TY-ipHashes','X-TY-visitorHash','X-TY-visitorMode','X-TY-guestMonthKey','X-TY-custMonthKey','X-TY-activeIpKey','X-TY-activeIpKeys','X-TY-reason','X-TY-kvStyle'].join(', ')
   );
 }
 function getDebugFlag(req, body) {
@@ -371,9 +384,11 @@ module.exports = async (req, res) => {
     const hasRealIp = ipInfo.kind !== 'pseudo';
     const uaForHash = (req.headers['user-agent'] || '').toString().slice(0, 200);
 
-    // IMPORTANT: Active-IP key ignores UA so desktop/phone/VPN share the 48h reuse.
-    const ipHashActive = hasRealIp ? hmacHash(ipInfo.ip) : null;
+    // Build BOTH possible active-IP hashes (IP-only and legacy IP+UA); de-duped
+    const activeIpHashes = hasRealIp ? buildActiveIpHashes(ipInfo.ip, uaForHash) : [];
+    const activeIpKeys   = activeIpHashes.map(h => `ty:ip:${h}`);
 
+    // Visitor hash (mode selectable)
     const visitorId   = getOrCreateVisitorId(req, res);
     const visitorHash = makeVisitorHash({
       mode: VISITOR_KEY_MODE, vid: visitorId,
@@ -388,20 +403,21 @@ module.exports = async (req, res) => {
     const periodLabel = `${cy}${cm}`;
 
     // Keys
-    const kvKeyActiveIp    = hasRealIp ? `ty:ip:${ipHashActive}` : null;
-    const kvKeyEverIp      = hasRealIp ? `ty:ip:ever:${ipHashActive}` : null;
+    const kvKeyEverIp      = hasRealIp ? `ty:ip:ever:${activeIpHashes[0]}` : null; // use first (IP-only) for "ever"
     const kvKeyGuestPeriod = `ty:guest:period:${PERIOD_MONTHS}m:${periodLabel}:${visitorHash}`;
     const kvKeyCustPeriod  = customerKeyHash ? `ty:cust:period:${PERIOD_MONTHS}m:${periodLabel}:${customerKeyHash}` : null;
     const kvKeyCustEver    = customerKeyHash ? `ty:cust:ever:${customerKeyHash}` : null;
 
     setDebugHeaders(res, {
       ipKind: ipInfo.kind,
-      ipHash: ipHashActive,
+      ipHash: activeIpHashes[0],
+      ipHashes: activeIpHashes,
       visitorHash,
       visitorMode: VISITOR_KEY_MODE,
       guestMonthKey: kvKeyGuestPeriod,
       custMonthKey: kvKeyCustPeriod,
-      activeIpKey: kvKeyActiveIp,
+      activeIpKey: activeIpKeys[0],
+      activeIpKeys: activeIpKeys,
       kvStyle: KV_STYLE
     });
 
@@ -414,7 +430,8 @@ module.exports = async (req, res) => {
     if (DEBUG) {
       const existingGuest = await kvGet(kvKeyGuestPeriod).catch(e => ({ kvError: String(e?.message || e) }));
       const existingCust  = kvKeyCustPeriod ? await kvGet(kvKeyCustPeriod).catch(e => ({ kvError: String(e?.message || e) })) : null;
-      const existingAct   = kvKeyActiveIp ? await kvGet(kvKeyActiveIp).catch(e => ({ kvError: String(e?.message || e) })) : null;
+      let existingAct = null;
+      for (const k of activeIpKeys) { existingAct = await kvGet(k).catch(()=>null); if (existingAct) break; }
       const existingEverI = kvKeyEverIp ? await kvGet(kvKeyEverIp).catch(e => ({ kvError: String(e?.message || e) })) : null;
       const existingEverC = kvKeyCustEver ? await kvGet(kvKeyCustEver).catch(e => ({ kvError: String(e?.message || e) })) : null;
 
@@ -439,35 +456,35 @@ module.exports = async (req, res) => {
         ok: !wouldBlock,
         debug: true,
         reason,
-        keys: { kvKeyGuestPeriod, kvKeyCustPeriod, kvKeyActiveIp, kvKeyEverIp, kvKeyCustEver },
+        keys: { kvKeyGuestPeriod, kvKeyCustPeriod, activeIpKeys, kvKeyEverIp, kvKeyCustEver },
         existing: { guestMonthly: existingGuest, customerMonthly: existingCust, activeIp: existingAct, everIp: existingEverI, everCustomer: existingEverC },
         note: 'No writes performed in debug mode.'
       });
     }
 
     // -------- Active IP reuse (DO THIS FIRST) --------
-    if (hasRealIp && kvKeyActiveIp) {
+    if (hasRealIp && activeIpKeys.length) {
       try {
-        const existing = await kvGet(kvKeyActiveIp);
-        if (existing) {
+        for (const k of activeIpKeys) {
+          const existing = await kvGet(k);
+          if (!existing) continue;
           const existingEnd = Date.parse(existing.endsAt);
           if (existingEnd > now) {
             return res.status(200).json({
               ok: true, reused: true, reason: 'active-ip-reuse',
               code: existing.code, startsAt: existing.startsAt, endsAt: existing.endsAt,
-              nodeId: existing.nodeId || null, ipKind: ipInfo.kind
+              nodeId: existing.nodeId || null, ipKind: ipInfo.kind, activeKey: k
             });
           }
           if (TY_COOLDOWN_HOURS > 0) {
             const cooldownUntil = existingEnd + TY_COOLDOWN_HOURS * 3600 * 1000;
             if (cooldownUntil > now) {
               return res.status(429).json({
-                error: 'rate_limited',
-                reason: 'cooldown-active',
+                error: 'rate_limited', reason: 'cooldown-active',
                 message: 'Already claimed from your network. Try again later.',
                 code: existing.code, endsAt: existing.endsAt,
                 cooldownUntil: new Date(cooldownUntil).toISOString(),
-                ipKind: ipInfo.kind
+                ipKind: ipInfo.kind, activeKey: k
               });
             }
           }
@@ -586,14 +603,17 @@ module.exports = async (req, res) => {
       });
     }
 
-    // Active IP lock through expiry (+ cooldown if any)
-    if (hasRealIp && kvKeyActiveIp) {
+    // Active IP lock through expiry (+ cooldown if any) — dual-write (IP-only and legacy IP+UA)
+    if (hasRealIp && activeIpKeys.length) {
       const ttlSecActive =
         Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000)) +
         Math.max(0, Math.floor(TY_COOLDOWN_HOURS * 3600));
-      await kvSetEx(kvKeyActiveIp, {
-        code, startsAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId
-      }, ttlSecActive);
+      const payload = { code, startsAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId };
+
+      for (const k of activeIpKeys) {
+        try { await kvSetEx(k, payload, ttlSecActive); }
+        catch (e) { setDebugHeaders(res, { ipWriteWarn: String(e?.message || e), ipKey: k }); }
+      }
     }
 
     // Optional "once ever"
