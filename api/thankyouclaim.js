@@ -75,7 +75,8 @@ async function kvGet(key) {
 
 async function kvSetEx(key, value, ttlSeconds) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) throw new Error('Upstash not configured');
-  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?ex=${encodeURIComponent(ttlSeconds)}`;
+  // Upstash expects EX (uppercase)
+  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${encodeURIComponent(ttlSeconds)}`;
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
   if (!r.ok) throw new Error(`Upstash SET EX failed: ${r.status}`);
   const data = await r.json().catch(() => ({}));
@@ -85,8 +86,8 @@ async function kvSetEx(key, value, ttlSeconds) {
 
 async function kvSetNxEx(key, value, ttlSeconds) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) throw new Error('Upstash not configured');
-  // Upstash REST uses lowercase booleans: nx=true
-  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?ex=${encodeURIComponent(ttlSeconds)}&nx=true`;
+  // Upstash expects NX=1 and EX (both uppercase)
+  const url = `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}?EX=${encodeURIComponent(ttlSeconds)}&NX=1`;
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }});
   if (!r.ok) throw new Error(`Upstash SET NX EX failed: ${r.status}`);
   const data = await r.json().catch(() => null);
