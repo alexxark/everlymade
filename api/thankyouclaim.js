@@ -68,6 +68,9 @@ function assertEnvOrThrow() {
   if (!SHOPIFY_ADMIN_TOKEN) missing.push('SHOPIFY_ADMIN_TOKEN');
   if (!KV_URL) missing.push('KV_REST_API_URL or UPSTASH_REDIS_REST_URL');
   if (!KV_TOKEN) missing.push('KV_REST_API_TOKEN or UPSTASH_REDIS_REST_TOKEN');
+  if (!process.env.IP_HASH_SALT || process.env.IP_HASH_SALT === 'change-me-long-random-salt') {
+    missing.push('IP_HASH_SALT (must be a strong secret)');
+  }
   if (missing.length) throw new Error(`Missing ENV: ${missing.join(', ')}`);
 }
 
@@ -164,7 +167,8 @@ function genCode(prefix = 'TY') {
   return `${prefix}-${four}`;
 }
 function isPrivateIp(ip) {
-  return /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[0-1])\.|^127\.|^::1$|^fc00:|^fe80:/.test(ip);
+  // IPv6 ULA is fc00::/7 => fc00::/8 and fd00::/8
+  return /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[0-1])\.|^127\.|^::1$|^f[cd]00:|^fe80:/i.test(ip);
 }
 function normalizeIp(ip) {
   return String(ip || '').replace(/^::ffff:/, '');
@@ -242,6 +246,41 @@ function getHouseholdAnchor(ip) {
     if (v6) return `net:${v6}`;
   }
   return `ip:${clean}`; // fallback exact IP
+}
+
+// Collect all public IPs we can see across headers (may include both v4 and v6)
+function collectClientIps(req) {
+  const out = new Set();
+  const add = (ip) => {
+    ip = normalizeIp(ip);
+    if (!ip) return;
+    if (/^[0-9a-fA-F:.]+$/.test(ip) && !isPrivateIp(ip)) out.add(ip);
+  };
+  const hdrs = [
+    req.headers['cf-connecting-ip'],
+    req.headers['true-client-ip'],
+    req.headers['x-vercel-forwarded-for'],
+    req.headers['x-forwarded-for'],
+  ].filter(Boolean);
+  for (const h of hdrs) {
+    String(h).split(',').map(s => s.trim()).filter(Boolean).forEach(add);
+  }
+  if (req.headers['x-real-ip']) add(req.headers['x-real-ip']);
+  if (req?.socket?.remoteAddress) add(req.socket.remoteAddress);
+  return Array.from(out);
+}
+
+// Derive anchors (/24, /64, and exact fallback) from a list of IPs
+function anchorsFromIps(ips) {
+  const set = new Set();
+  for (const ip of ips) {
+    const v4p = ipV4Prefix(ip);
+    const v6p = ip.includes(':') ? ipV6Prefix(ip) : null;
+    if (v4p) set.add(`net:${v4p}`);
+    if (v6p) set.add(`net:${v6p}`);
+    set.add(`ip:${normalizeIp(ip)}`); // exact fallback
+  }
+  return Array.from(set);
 }
 
 // ----- Visitor identity -----
@@ -329,8 +368,8 @@ function setDebugHeaders(res, obj = {}) {
   res.setHeader('Access-Control-Expose-Headers',
     [
       'X-TY-ipKind','X-TY-ipHash','X-TY-ipHashes','X-TY-visitorHash','X-TY-visitorMode',
-      'X-TY-householdKey','X-TY-activeIpKey','X-TY-activeIpKeys',
-      'X-TY-reason','X-TY-kvStyle','X-TY-scope'
+      'X-TY-householdKey','X-TY-householdKeys','X-TY-activeIpKey','X-TY-activeIpKeys',
+      'X-TY-reason','X-TY-kvStyle','X-TY-scope','X-TY-apiVersion','X-TY-shop'
     ].join(', ')
   );
 }
@@ -376,7 +415,7 @@ module.exports = async (req, res) => {
     const customerEmailRaw   = body?.customerEmail || null;     // optional
 
     if (REQUIRE_SIGNED_IN && !customerIdRaw && !customerEmailRaw) {
-      setDebugHeaders(res, { reason: 'signin_required' });
+      setDebugHeaders(res, { reason: 'signin_required', apiVersion: API_VERSION, shop: SHOPIFY_SHOP });
       return res.status(401).json({ error: 'signin_required', reason: 'signin_required' });
     }
 
@@ -405,24 +444,24 @@ module.exports = async (req, res) => {
     const activeIpHashes = hasRealIp ? buildActiveIpHashes(ipInfo.ip, uaForHash) : [];
     const activeIpKeys   = activeIpHashes.map(h => `ty:ip:${h}`);
 
-    // Household-wide monthly key (anchor on prefix if available, else exact IP)
+    // Monthly windows (YYYYMM label)
     const periodStart = getPeriodStart(now);
     const periodEndsAt = getPeriodEnd(now, PERIOD_MONTHS);
     const ttlSecPeriod = secondsUntil(now, periodEndsAt);
     const cy = periodStart.getUTCFullYear();
     const cm = String(periodStart.getUTCMonth() + 1).padStart(2, '0');
     const periodLabel = `${cy}${cm}`;
-    let householdKey = null;
 
+    // Household keys: multi-anchor if we have real public IPs; else visitor key
+    let houseKeys = [];
     if (hasRealIp) {
-      const anchor = getHouseholdAnchor(ipInfo.ip);         // "net:x.x.x.0/24" or "ip:x.x.x.x"
-      const anchorHash = hmacHash(anchor);
-      householdKey = `ty:month:${PERIOD_MONTHS}m:${periodLabel}:house:${anchorHash}`;
+      const allIps = collectClientIps(req);
+      const anchors = allIps.length ? anchorsFromIps(allIps) : [ getHouseholdAnchor(ipInfo.ip) ];
+      houseKeys = anchors.map(a => `ty:month:${PERIOD_MONTHS}m:${periodLabel}:house:${hmacHash(a)}`);
     } else {
-      // fallback when no real IP is present (rare in production)
       const vid = getOrCreateVisitorId(req, res);
       const visitorHash = makeVisitorHash({ mode: VISITOR_KEY_MODE, vid, hasRealIp, ip: ipInfo.ip, ua: uaForHash });
-      householdKey = `ty:month:${PERIOD_MONTHS}m:${periodLabel}:visitor:${visitorHash}`;
+      houseKeys = [`ty:month:${PERIOD_MONTHS}m:${periodLabel}:visitor:${visitorHash}`];
     }
 
     // Ever keys (STRICT_ONCE disabled by default)
@@ -435,11 +474,14 @@ module.exports = async (req, res) => {
       ipHashes: activeIpHashes,
       visitorHash: null, // not used for monthly when IP is real
       visitorMode: VISITOR_KEY_MODE,
-      householdKey,
+      householdKey: houseKeys[0],
+      householdKeys: houseKeys,
       activeIpKey: activeIpKeys[0],
       activeIpKeys,
       kvStyle: KV_STYLE,
-      scope: ACTIVE_IP_SCOPE
+      scope: ACTIVE_IP_SCOPE,
+      apiVersion: API_VERSION,
+      shop: SHOPIFY_SHOP
     });
 
     if (!hasRealIp && !customerKeyHash && REQUIRE_REAL_IP_FOR_GUEST) {
@@ -451,18 +493,19 @@ module.exports = async (req, res) => {
     if (DEBUG) {
       let existingAct = null, activeHitKey = null;
       for (const k of activeIpKeys) { existingAct = await kvGet(k).catch(()=>null); if (existingAct) { activeHitKey = k; break; } }
-      const existingHouse = await kvGet(householdKey).catch(()=>null);
+      const existingHouses = await Promise.all(houseKeys.map(hk => kvGet(hk).catch(()=>null)));
       const existingEverI = kvKeyEverIp ? await kvGet(kvKeyEverIp).catch(()=>null) : null;
       const existingEverC = kvKeyCustEver ? await kvGet(kvKeyCustEver).catch(()=>null) : null;
 
       setDebugHeaders(res, { debug: '1', activeHitKey });
       return res.status(200).json({
         ok: true, debug: true,
-        keys: { householdKey, activeIpKeys, kvKeyEverIp, kvKeyCustEver },
-        existing: { household: existingHouse, activeIp: existingAct, everIp: existingEverI, everCustomer: existingEverC },
+        keys: { householdKeys: houseKeys, activeIpKeys, kvKeyEverIp, kvKeyCustEver },
+        existing: { household: existingHouses, activeIp: existingAct, everIp: existingEverI, everCustomer: existingEverC },
         note: 'No writes performed in debug mode.'
       });
     }
+    // no writes happen above this line
 
     // -------- Active IP reuse (FIRST) --------
     if (hasRealIp && activeIpKeys.length) {
@@ -472,12 +515,14 @@ module.exports = async (req, res) => {
           if (!existing) continue;
           const existingEnd = Date.parse(existing.endsAt);
           if (existingEnd > now) {
-            // Mirror to all keys so the whole household (and legacy) aligns immediately
+            // Mirror to all active keys INCLUDING net anchors inferred from all visible IPs
             try {
+              const allIps  = collectClientIps(req);
+              const anchors = anchorsFromIps(allIps);
+              const netKeys = anchors.map(a => `ty:ip:${hmacHash(a)}`);
+              const allActiveKeys = Array.from(new Set([...activeIpKeys, ...netKeys]));
               const ttlLeft = Math.max(1, Math.ceil((existingEnd - now) / 1000));
-              for (const mk of activeIpKeys) {
-                await kvSetEx(mk, existing, ttlLeft);
-              }
+              await Promise.all(allActiveKeys.map(mk => kvSetEx(mk, existing, ttlLeft).catch(()=>{})));
             } catch {}
             return res.status(200).json({
               ok: true, reused: true, reason: 'active-ip-reuse',
@@ -518,18 +563,29 @@ module.exports = async (req, res) => {
       }
     }
 
-    // -------- MONTHLY RESERVATION (HOUSEHOLD-WIDE) --------
+    // -------- MONTHLY RESERVATION (HOUSEHOLD-WIDE, multi-anchor) --------
     const reservePayload = { code: null, marker: 'house-reserve', firstClaimAt: new Date(now).toISOString(), periodEndsAt: periodEndsAt.toISOString(), nodeId: null };
-    let reservedOk = false;
-    try {
-      reservedOk = await kvSetNxEx(householdKey, reservePayload, ttlSecPeriod);
-    } catch (kvErr) {
-      setDebugHeaders(res, { reason: 'kv-failure', kvError: String(kvErr?.message || kvErr), kvStyle: KV_STYLE });
-      return res.status(500).json({ error: 'kv_unavailable', message: String(kvErr?.message || kvErr) });
-    }
 
-    if (!reservedOk) {
-      const existing = await kvGet(householdKey).catch(()=>null);
+    // reserve on ALL anchors; rollback if any conflict
+    const reserved = [];
+    for (const hk of houseKeys) {
+      try {
+        const ok = await kvSetNxEx(hk, reservePayload, ttlSecPeriod);
+        reserved.push([hk, ok]);
+      } catch (kvErr) {
+        // kv outage—rollback any prior reservations
+        await Promise.all(reserved.filter(([,ok]) => ok).map(([k]) => kvDel(k).catch(()=>{})));
+        setDebugHeaders(res, { reason: 'kv-failure', kvError: String(kvErr?.message || kvErr), kvStyle: KV_STYLE });
+        return res.status(500).json({ error: 'kv_unavailable', message: String(kvErr?.message || kvErr) });
+      }
+    }
+    const allOk = reserved.every(([,ok]) => ok);
+    if (!allOk) {
+      // someone in this household already claimed via another family/prefix
+      await Promise.all(reserved.filter(([,ok]) => ok).map(([k]) => kvDel(k).catch(()=>{})));
+      // try to fetch an existing record (from the conflicting key if possible)
+      const conflictKey = (reserved.find(([,ok]) => !ok) || [houseKeys[0]])[0];
+      const existing = await kvGet(conflictKey).catch(()=>null);
       return res.status(429).json({
         error: 'already_claimed_monthly',
         reason: 'monthly-lock-household',
@@ -541,54 +597,61 @@ module.exports = async (req, res) => {
 
     // -------- Mint code via Shopify (48h) --------
     let code = null, nodeId = null;
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      const tryCode = genCode('TY');
-      try {
-        const id = await createDiscountBasic({
-          code: tryCode,
-          startsAt: startsAt.toISOString(),
-          endsAt:   chosenEndsAt.toISOString(),
-          percent:  TY_PERCENT
-        });
-        code = tryCode; nodeId = id; break;
-      } catch (err) {
-        if (String(err?.message || '').includes('Code collision')) continue;
-        try { await kvDel(householdKey); } catch {}
-        throw err;
+    try {
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        const tryCode = genCode('TY');
+        try {
+          const id = await createDiscountBasic({
+            code: tryCode,
+            startsAt: startsAt.toISOString(),
+            endsAt:   chosenEndsAt.toISOString(),
+            percent:  TY_PERCENT
+          });
+          code = tryCode; nodeId = id; break;
+        } catch (err) {
+          if (String(err?.message || '').includes('Code collision')) continue;
+          throw err;
+        }
       }
-    }
-    if (!code) {
-      try { await kvDel(householdKey); } catch {}
-      return res.status(502).json({ error: 'Failed to create discount code' });
+      if (!code) throw new Error('Failed to create discount code');
+    } catch (err) {
+      // rollback reservations on failure
+      await Promise.all(houseKeys.map(hk => kvDel(hk).catch(()=>{})));
+      return res.status(502).json({ error: 'Failed to create discount code', message: String(err?.message || err) });
     }
 
-    // Persist monthly (household)
+    // Persist monthly (household) with TTL to end-of-period
     const monthlyRecord = { code, nodeId, firstClaimAt: new Date(now).toISOString(), periodEndsAt: periodEndsAt.toISOString() };
-    await kvSet(householdKey, monthlyRecord);
+    await Promise.all(houseKeys.map(hk => kvSetEx(hk, monthlyRecord, ttlSecPeriod)));
 
-    // Race defense (extremely rare)
-    const checkHouse = await kvGet(householdKey);
-    if (checkHouse && checkHouse.code && checkHouse.code !== code) {
+    // Race defense (extremely rare): if any key got a different code, revoke the fresh mint
+    const checkHouses = await Promise.all(houseKeys.map(hk => kvGet(hk).catch(()=>null)));
+    const mismatch = checkHouses.find(r => r && r.code && r.code !== code);
+    if (mismatch) {
       try { await deleteDiscountByNodeId(nodeId); } catch {}
       return res.status(429).json({
         error: 'already_claimed_monthly',
         reason: 'monthly-lock-race',
         periodEndsAt: periodEndsAt.toISOString(),
-        code: checkHouse.code, revokedNewMint: true, reused: true, ipKind: ipInfo.kind
+        code: mismatch.code, revokedNewMint: true, reused: true, ipKind: ipInfo.kind
       });
     }
 
-    // Active IP lock through expiry (+ cooldown if any) — write to all active keys (exact, legacy, household)
-    if (hasRealIp && activeIpKeys.length) {
+    // Active IP lock through expiry (+ cooldown if any) — write to all active keys (exact, legacy, + net anchors)
+    if (hasRealIp) {
+      const allIps  = collectClientIps(req);
+      const anchors = anchorsFromIps(allIps);
+      const netActiveKeys = anchors.map(a => `ty:ip:${hmacHash(a)}`);
+      const allActiveKeys = Array.from(new Set([...(activeIpKeys || []), ...netActiveKeys]));
+
       const ttlSecActive =
         Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000)) +
         Math.max(0, Math.floor(TY_COOLDOWN_HOURS * 3600));
       const payload = { code, startsAt: startsAt.toISOString(), endsAt: chosenEndsAt.toISOString(), nodeId };
 
-      for (const k of activeIpKeys) {
-        try { await kvSetEx(k, payload, ttlSecActive); }
-        catch (e) { setDebugHeaders(res, { ipWriteWarn: String(e?.message || e), ipKey: k }); }
-      }
+      await Promise.all(allActiveKeys.map(k =>
+        kvSetEx(k, payload, ttlSecActive).catch(e => setDebugHeaders(res, { ipWriteWarn: String(e?.message || e), ipKey: k }))
+      ));
     }
 
     // Optional "once ever"
@@ -603,7 +666,7 @@ module.exports = async (req, res) => {
     const cookieMaxAge = Math.max(1, Math.ceil((chosenEndsAt.getTime() - now) / 1000));
     setCookie(res, 'ty_claimed', '1', { maxAgeSec: cookieMaxAge });
 
-    setDebugHeaders(res, { reason: 'minted', code, nodeId, endsAt: chosenEndsAt.toISOString(), ipKind: ipInfo.kind, apiVersion: API_VERSION, kvStyle: KV_STYLE, scope: ACTIVE_IP_SCOPE });
+    setDebugHeaders(res, { reason: 'minted', code, nodeId, endsAt: chosenEndsAt.toISOString(), ipKind: ipInfo.kind, apiVersion: API_VERSION, kvStyle: KV_STYLE, scope: ACTIVE_IP_SCOPE, shop: SHOPIFY_SHOP });
 
     return res.status(200).json({
       ok: true, reason: 'minted',
@@ -615,7 +678,7 @@ module.exports = async (req, res) => {
 
   } catch (e) {
     console.error('Unhandled error creating discount', e);
-    setDebugHeaders(res, { reason: 'server-error', error: String(e?.message || e), apiVersion: API_VERSION, scope: ACTIVE_IP_SCOPE });
+    setDebugHeaders(res, { reason: 'server-error', error: String(e?.message || e), apiVersion: API_VERSION, scope: ACTIVE_IP_SCOPE, shop: SHOPIFY_SHOP });
     return res.status(500).json({ error: 'Unhandled error', message: e?.message || String(e) });
   }
 };
@@ -628,7 +691,11 @@ function getClientIpDetailed(req) {
   const vff = pick(req.headers['x-vercel-forwarded-for']);  if (vff) return { ip: vff.split(',')[0].trim().replace(/^::ffff:/, ''), kind: 'vff' };
   const xff = pick(req.headers['x-forwarded-for']);
   if (xff) {
-    const parts = xff.split(',').map(s => s.trim()).filter(Boolean).map(s => s.replace(/^::ffff:/, ''));
+    const parts = xff.split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(s => s.replace(/^::ffff:/, ''))
+      .filter(s => /^[0-9a-fA-F:.]+$/.test(s)); // keep only IP-ish strings
     for (const ip of parts) { if (!isPrivateIp(ip)) return { ip, kind: 'xff' }; }
     if (parts.length) return { ip: parts[0], kind: 'xff' };
   }
