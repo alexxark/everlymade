@@ -333,23 +333,23 @@ async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
       title: code,
       startsAt,
       endsAt,
-      // same as before: anyone can use it
+      // anyone can use it
       customerSelection: { all: true },
-      // 👇 Amount-off *products* in a specific collection
+
+      // 👉 20% off products in Discount Eligible collection
       customerGets: {
         items: {
           collections: {
-            // NOTE: DiscountCollectionsInput uses `add`, not `collectionIds`
+            // DiscountCollectionsInput uses `add`
             add: ["gid://shopify/Collection/497414078761"]
           }
         },
         value: {
-          // 20% off selected products
           percentage: Math.min(1, Math.max(0, percent / 100))
-        },
-        appliesOnOneTimePurchase: true,
-        appliesOnSubscription: true
+        }
+        // NOTE: no appliesOnSubscription / appliesOnOneTimePurchase here
       },
+
       combinesWith: {
         orderDiscounts: false,
         productDiscounts: true,
