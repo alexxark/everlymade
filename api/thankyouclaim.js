@@ -352,7 +352,7 @@ async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
 
       combinesWith: {
         orderDiscounts: false,
-        productDiscounts: true,
+        productDiscounts: false,
         shippingDiscounts: true
       },
       usageLimit: 1,
