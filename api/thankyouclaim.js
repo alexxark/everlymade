@@ -333,19 +333,28 @@ async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
       title: code,
       startsAt,
       endsAt,
+      // same as before: anyone can use it
       customerSelection: { all: true },
+      // 👇 Amount-off *products* in a specific collection
       customerGets: {
-        value: {
-          percentage: Math.min(1, Math.max(0, percent / 100)),
-        },
         items: {
           collections: {
-            // IMPORTANT: correct field is collectionIds
-            collectionIds: [DISCOUNT_COLLECTION_ID],
-          },
+            // NOTE: DiscountCollectionsInput uses `add`, not `collectionIds`
+            add: ["gid://shopify/Collection/497414078761"]
+          }
         },
+        value: {
+          // 20% off selected products
+          percentage: Math.min(1, Math.max(0, percent / 100))
+        },
+        appliesOnOneTimePurchase: true,
+        appliesOnSubscription: true
       },
-      combinesWith: { orderDiscounts: false, productDiscounts: true, shippingDiscounts: true },
+      combinesWith: {
+        orderDiscounts: false,
+        productDiscounts: true,
+        shippingDiscounts: true
+      },
       usageLimit: 1,
       appliesOncePerCustomer: true,
       code
@@ -355,12 +364,16 @@ async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
   const { ok, data, status } = await shopifyGraphQL(mutation, variables);
   if (!ok) throw new Error(`Shopify HTTP ${status}`);
   if (data?.errors?.length) throw new Error(`GraphQL: ${JSON.stringify(data.errors)}`);
+
   const errs = data?.data?.discountCodeBasicCreate?.userErrors;
   if (errs?.length) {
-    const exists = errs.find(e => String(e.message || '').toLowerCase().includes('already exists'));
+    const exists = errs.find(e =>
+      String(e.message || '').toLowerCase().includes('already exists')
+    );
     if (exists) throw new Error('Code collision');
     throw new Error(`Shopify validation: ${JSON.stringify(errs)}`);
   }
+
   const node = data?.data?.discountCodeBasicCreate?.codeDiscountNode;
   if (!node) throw new Error('No codeDiscountNode returned');
   return node.id;
