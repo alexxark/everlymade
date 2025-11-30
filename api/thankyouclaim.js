@@ -33,9 +33,8 @@ const SHOPIFY_SHOP        = process.env.SHOPIFY_SHOP;
 const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const API_VERSION         = process.env.SHOPIFY_API_VERSION || '2025-07';
 
-// Scope discount to this collection only: “Discount Eligible”
+// Scope to “Discount Eligible” collection
 // Admin URL: https://admin.shopify.com/store/charmsforchange/collections/497414078761
-// GID form:
 const DISCOUNT_COLLECTION_ID = 'gid://shopify/Collection/497414078761';
 
 // ----- KV / Redis (Upstash or Vercel) -----
@@ -319,24 +318,8 @@ async function shopifyGraphQL(query, variables) {
   return { ok: r.ok, data, status: r.status };
 }
 
-// NOTE: this now creates an “Amount off products” discount scoped to the
-// “Discount Eligible” collection (DISCOUNT_COLLECTION_ID), 20% off.
+// Creates a 20% “amount off products” discount, scoped to the Discount Eligible collection
 async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
-  const mutation = `
-    mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
-      discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
-        codeDiscountNode { id }
-        userErrors { field message }
-      }
-    }`;
-
-  const variables = {
-    basicCodeDiscount: {
-      title: code,
-      startsAt,
-      endsAt,
-      customerSelection: { all: true },
-      async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
   const mutation = `
     mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
       discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
@@ -353,42 +336,15 @@ async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
       customerSelection: { all: true },
       customerGets: {
         value: {
-          // 20% off products in the collection
           percentage: Math.min(1, Math.max(0, percent / 100)),
         },
         items: {
           collections: {
-            // ✅ correct field name
+            // IMPORTANT: correct field is collectionIds
             collectionIds: [DISCOUNT_COLLECTION_ID],
           },
         },
       },
-      combinesWith: {
-        orderDiscounts: false,
-        productDiscounts: true,
-        shippingDiscounts: true,
-      },
-      usageLimit: 1,
-      appliesOncePerCustomer: true,
-      code,
-    },
-  };
-
-  const { ok, data, status } = await shopifyGraphQL(mutation, variables);
-  if (!ok) throw new Error(`Shopify HTTP ${status}`);
-  if (data?.errors?.length) throw new Error(`GraphQL: ${JSON.stringify(data.errors)}`);
-  const errs = data?.data?.discountCodeBasicCreate?.userErrors;
-  if (errs?.length) {
-    const exists = errs.find(e =>
-      String(e.message || '').toLowerCase().includes('already exists')
-    );
-    if (exists) throw new Error('Code collision');
-    throw new Error(`Shopify validation: ${JSON.stringify(errs)}`);
-  }
-  const node = data?.data?.discountCodeBasicCreate?.codeDiscountNode;
-  if (!node) throw new Error('No codeDiscountNode returned');
-  return node.id;
-}
       combinesWith: { orderDiscounts: false, productDiscounts: true, shippingDiscounts: true },
       usageLimit: 1,
       appliesOncePerCustomer: true,
