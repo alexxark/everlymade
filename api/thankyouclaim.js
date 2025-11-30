@@ -336,19 +336,59 @@ async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
       startsAt,
       endsAt,
       customerSelection: { all: true },
+      async function createDiscountBasic({ code, startsAt, endsAt, percent }) {
+  const mutation = `
+    mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
+      discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
+        codeDiscountNode { id }
+        userErrors { field message }
+      }
+    }`;
+
+  const variables = {
+    basicCodeDiscount: {
+      title: code,
+      startsAt,
+      endsAt,
+      customerSelection: { all: true },
       customerGets: {
         value: {
-          // 20% off products (not order-wide)
+          // 20% off products in the collection
           percentage: Math.min(1, Math.max(0, percent / 100)),
         },
         items: {
-          // Scope to specific collection (“Discount Eligible”)
           collections: {
-            // For 2025-07+ API, collectionsToAdd is the current field name
-            collectionsToAdd: [DISCOUNT_COLLECTION_ID],
+            // ✅ correct field name
+            collectionIds: [DISCOUNT_COLLECTION_ID],
           },
         },
       },
+      combinesWith: {
+        orderDiscounts: false,
+        productDiscounts: true,
+        shippingDiscounts: true,
+      },
+      usageLimit: 1,
+      appliesOncePerCustomer: true,
+      code,
+    },
+  };
+
+  const { ok, data, status } = await shopifyGraphQL(mutation, variables);
+  if (!ok) throw new Error(`Shopify HTTP ${status}`);
+  if (data?.errors?.length) throw new Error(`GraphQL: ${JSON.stringify(data.errors)}`);
+  const errs = data?.data?.discountCodeBasicCreate?.userErrors;
+  if (errs?.length) {
+    const exists = errs.find(e =>
+      String(e.message || '').toLowerCase().includes('already exists')
+    );
+    if (exists) throw new Error('Code collision');
+    throw new Error(`Shopify validation: ${JSON.stringify(errs)}`);
+  }
+  const node = data?.data?.discountCodeBasicCreate?.codeDiscountNode;
+  if (!node) throw new Error('No codeDiscountNode returned');
+  return node.id;
+}
       combinesWith: { orderDiscounts: false, productDiscounts: true, shippingDiscounts: true },
       usageLimit: 1,
       appliesOncePerCustomer: true,
